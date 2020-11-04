@@ -52,6 +52,11 @@ inherit_rbconfig 'LDFLAGS'
 ENV['LD'] = ENV['CC'] if env_unset?('LD')
 ENV['LDXX'] = ENV['CXX'] if env_unset?('LDXX')
 
+if RUBY_ENGINE == 'truffleruby'
+  # ensure we can find the system's OpenSSL
+  env_append 'CPPFLAGS', RbConfig::CONFIG['cppflags']
+end
+
 def apple_toolchain?
   # TruffleRuby uses the Sulong LLVM runtime, which is different from Apple's.
   RUBY_PLATFORM =~ /darwin/ && RUBY_ENGINE != 'truffleruby'
@@ -77,7 +82,7 @@ if apple_toolchain?
   end
 end
 
-ENV['CPPFLAGS'] = '-DGPR_BACKWARDS_COMPATIBILITY_MODE'
+env_append 'CPPFLAGS', '-DGPR_BACKWARDS_COMPATIBILITY_MODE'
 ENV['CPPFLAGS'] += ' -DGRPC_XDS_USER_AGENT_NAME_SUFFIX="\"RUBY\"" '
 ENV['CPPFLAGS'] += ' -DGRPC_XDS_USER_AGENT_VERSION_SUFFIX="\"1.40.0\"" '
 
