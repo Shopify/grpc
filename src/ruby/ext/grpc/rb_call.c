@@ -801,13 +801,13 @@ static VALUE grpc_run_batch_stack_build_result(run_batch_stack* st) {
 }
 
 typedef struct grpc_rb_call_run_batch_data {
-    VALUE self;
-    VALUE ops_hash;
-    run_batch_stack* st;
+  VALUE self;
+  VALUE ops_hash;
+  run_batch_stack* st;
 } grpc_rb_call_run_batch_data;
 
 static VALUE grpc_rb_call_run_batch_ensure(VALUE vdata) {
-  grpc_rb_call_run_batch_data *data = (grpc_rb_call_run_batch_data *)vdata;
+  grpc_rb_call_run_batch_data* data = (grpc_rb_call_run_batch_data*)vdata;
   run_batch_stack* st = data->st;
   if (st != NULL) {
     grpc_run_batch_stack_cleanup(st);
@@ -817,7 +817,7 @@ static VALUE grpc_rb_call_run_batch_ensure(VALUE vdata) {
 }
 
 static VALUE grpc_rb_call_run_batch_try(VALUE vdata) {
-  grpc_rb_call_run_batch_data *data = (grpc_rb_call_run_batch_data *)vdata;
+  grpc_rb_call_run_batch_data* data = (grpc_rb_call_run_batch_data*)vdata;
   VALUE self = data->self;
   VALUE ops_hash = data->ops_hash;
   run_batch_stack* st = NULL;
@@ -887,10 +887,7 @@ static VALUE grpc_rb_call_run_batch_try(VALUE vdata) {
    batch */
 static VALUE grpc_rb_call_run_batch(VALUE self, VALUE ops_hash) {
   grpc_rb_call_run_batch_data data = {
-    .self = self,
-    .ops_hash = ops_hash,
-    .st = NULL
-  };
+      .self = self, .ops_hash = ops_hash, .st = NULL};
 
   return rb_ensure(grpc_rb_call_run_batch_try, (VALUE)&data,
                    grpc_rb_call_run_batch_ensure, (VALUE)&data);
