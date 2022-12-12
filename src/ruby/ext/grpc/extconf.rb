@@ -79,7 +79,12 @@ $CFLAGS << ' -I' + File.join(grpc_root, 'include')
 
 ext_export_file = File.join(grpc_root, 'src', 'ruby', 'ext', 'grpc', 'ext-export')
 $LDFLAGS << ' -Wl,--version-script="' + ext_export_file + '.gcc"' if linux
-$LDFLAGS << ' -Wl,-exported_symbols_list,"' + ext_export_file + '.clang"' if darwin
+if darwin
+  $LDFLAGS << ' -Wl,-exported_symbols_list,"' + ext_export_file + '.clang"'
+  if RUBY_VERSION >= "3.2"
+    $LDFLAGS << " -Wl,-exported_symbol,_ruby_abi_version"
+  end
+end
 
 $LDFLAGS << ' ' + File.join(grpc_lib_dir, 'libgrpc.a') unless windows
 if grpc_config == 'gcov'
