@@ -81,7 +81,7 @@ ext_export_file = File.join(grpc_root, 'src', 'ruby', 'ext', 'grpc', 'ext-export
 $LDFLAGS << ' -Wl,--version-script="' + ext_export_file + '.gcc"' if linux
 if darwin
   $LDFLAGS << ' -Wl,-exported_symbols_list,"' + ext_export_file + '.clang"'
-  if RUBY_VERSION >= "3.2"
+  if RUBY_VERSION >= "3.2" && RUBY_PATCHLEVEL < 0
     $LDFLAGS << " -Wl,-exported_symbol,_ruby_abi_version"
   end
 end
