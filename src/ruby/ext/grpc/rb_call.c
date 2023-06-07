@@ -802,14 +802,14 @@ static VALUE grpc_run_batch_stack_build_result(run_batch_stack* st) {
 }
 
 struct call_run_batch_args {
-  grpc_rb_call *call;
+  grpc_rb_call* call;
   unsigned write_flag;
   VALUE ops_hash;
   run_batch_stack* st;
 };
 
 static VALUE grpc_rb_call_run_batch_try(VALUE value_args) {
-  struct call_run_batch_args *args = (struct call_run_batch_args *)value_args;
+  struct call_run_batch_args* args = (struct call_run_batch_args*)value_args;
   void* tag = (void*)&args->st;
 
   grpc_event ev;
@@ -821,7 +821,8 @@ static VALUE grpc_rb_call_run_batch_try(VALUE value_args) {
 
   /* call grpc_call_start_batch, then wait for it to complete using
    * pluck_event */
-  err = grpc_call_start_batch(args->call->wrapped, args->st->ops, args->st->op_num, tag, NULL);
+  err = grpc_call_start_batch(args->call->wrapped, args->st->ops,
+                              args->st->op_num, tag, NULL);
   if (err != GRPC_CALL_OK) {
     rb_raise(grpc_rb_eCallError,
              "grpc_call_start_batch failed with %s (code=%d)",
@@ -838,7 +839,7 @@ static VALUE grpc_rb_call_run_batch_try(VALUE value_args) {
 }
 
 static VALUE grpc_rb_call_run_batch_ensure(VALUE value_args) {
-  struct call_run_batch_args *args = (struct call_run_batch_args *)value_args;
+  struct call_run_batch_args* args = (struct call_run_batch_args*)value_args;
 
   if (args->st) {
     grpc_run_batch_stack_cleanup(args->st);
@@ -882,13 +883,13 @@ static VALUE grpc_rb_call_run_batch(VALUE self, VALUE ops_hash) {
   VALUE rb_write_flag = rb_ivar_get(self, id_write_flag);
 
   struct call_run_batch_args args = {
-    .call = call,
-    .write_flag = rb_write_flag == Qnil ? 0 : NUM2UINT(rb_write_flag),
-    .ops_hash = ops_hash,
-    .st = NULL
-  };
+      .call = call,
+      .write_flag = rb_write_flag == Qnil ? 0 : NUM2UINT(rb_write_flag),
+      .ops_hash = ops_hash,
+      .st = NULL};
 
-  return rb_ensure(grpc_rb_call_run_batch_try, (VALUE)&args, grpc_rb_call_run_batch_ensure, (VALUE)&args);
+  return rb_ensure(grpc_rb_call_run_batch_try, (VALUE)&args,
+                   grpc_rb_call_run_batch_ensure, (VALUE)&args);
 }
 
 static void Init_grpc_write_flags() {
