@@ -198,7 +198,8 @@ struct server_request_call_args {
 };
 
 static VALUE grpc_rb_server_request_call_try(VALUE value_args) {
-  struct server_request_call_args *args = (struct server_request_call_args *)value_args;
+  struct server_request_call_args* args =
+      (struct server_request_call_args*)value_args;
 
   grpc_call* call = NULL;
   void* tag = (void*)&args->st;
@@ -208,35 +209,39 @@ static VALUE grpc_rb_server_request_call_try(VALUE value_args) {
 
   /* call grpc_server_request_call, then wait for it to complete using
    * pluck_event */
-  grpc_call_error err = grpc_server_request_call(args->server->wrapped, &call, &args->st.details, &args->st.md_ary,
-                                 args->call_queue, args->server->queue, tag);
+  grpc_call_error err = grpc_server_request_call(
+      args->server->wrapped, &call, &args->st.details, &args->st.md_ary,
+      args->call_queue, args->server->queue, tag);
   if (err != GRPC_CALL_OK) {
     rb_raise(grpc_rb_eCallError,
              "grpc_server_request_call failed: %s (code=%d)",
              grpc_call_error_detail_of(err), err);
   }
 
-  grpc_event ev = rb_completion_queue_pluck(args->server->queue, tag,
-                                 gpr_inf_future(GPR_CLOCK_REALTIME), NULL);
+  grpc_event ev = rb_completion_queue_pluck(
+      args->server->queue, tag, gpr_inf_future(GPR_CLOCK_REALTIME), NULL);
   if (!ev.success) {
     rb_raise(grpc_rb_eCallError, "request_call completion failed");
   }
 
   /* build the NewServerRpc struct result */
-  gpr_timespec deadline = gpr_convert_clock_type(args->st.details.deadline, GPR_CLOCK_REALTIME);
-  VALUE result = rb_struct_new(
-      grpc_rb_sNewServerRpc, grpc_rb_slice_to_ruby_string(args->st.details.method),
-      grpc_rb_slice_to_ruby_string(args->st.details.host),
-      rb_funcall(rb_cTime, id_at, 2, INT2NUM(deadline.tv_sec),
-                 INT2NUM(deadline.tv_nsec / 1000)),
-      grpc_rb_md_ary_to_h(&args->st.md_ary), grpc_rb_wrap_call(call, args->call_queue),
-      NULL);
+  gpr_timespec deadline =
+      gpr_convert_clock_type(args->st.details.deadline, GPR_CLOCK_REALTIME);
+  VALUE result =
+      rb_struct_new(grpc_rb_sNewServerRpc,
+                    grpc_rb_slice_to_ruby_string(args->st.details.method),
+                    grpc_rb_slice_to_ruby_string(args->st.details.host),
+                    rb_funcall(rb_cTime, id_at, 2, INT2NUM(deadline.tv_sec),
+                               INT2NUM(deadline.tv_nsec / 1000)),
+                    grpc_rb_md_ary_to_h(&args->st.md_ary),
+                    grpc_rb_wrap_call(call, args->call_queue), NULL);
   args->call_queue = NULL;
   return result;
 }
 
 static VALUE grpc_rb_server_request_call_ensure(VALUE value_args) {
-  struct server_request_call_args *args = (struct server_request_call_args *)value_args;
+  struct server_request_call_args* args =
+      (struct server_request_call_args*)value_args;
 
   if (args->call_queue) {
     grpc_rb_completion_queue_destroy(args->call_queue);
@@ -259,12 +264,10 @@ static VALUE grpc_rb_server_request_call(VALUE self) {
     rb_raise(rb_eRuntimeError, "destroyed!");
   }
 
-  struct server_request_call_args args = {
-    .server = s,
-    .call_queue = NULL
-  };
+  struct server_request_call_args args = {.server = s, .call_queue = NULL};
 
-  return rb_ensure(grpc_rb_server_request_call_try, (VALUE)&args, grpc_rb_server_request_call_ensure, (VALUE)&args);
+  return rb_ensure(grpc_rb_server_request_call_try, (VALUE)&args,
+                   grpc_rb_server_request_call_ensure, (VALUE)&args);
 }
 
 static VALUE grpc_rb_server_start(VALUE self) {
