@@ -17,12 +17,13 @@
 //
 
 #include <grpc/support/port_platform.h>
-
+#include <stdio.h>
 #include "src/core/lib/iomgr/pollset.h"
 
 grpc_pollset_vtable* grpc_pollset_impl;
 
 void grpc_set_pollset_vtable(grpc_pollset_vtable* vtable) {
+  fprintf(stderr, "[GRPC] grpc_set_pollset_vtable(%p)\n", vtable);
   grpc_pollset_impl = vtable;
 }
 
