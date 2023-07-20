@@ -323,6 +323,7 @@ void grpc_ruby_fork_guard() {
 
 static VALUE g_bg_thread_init_rb_mu = Qundef;
 static bool g_bg_thread_init_done;
+static bool g_bg_thread_init_was_done = false;
 
 static void grpc_ruby_init_threads() {
   // Avoid calling into ruby library (when creating threads here)
@@ -397,6 +398,7 @@ static VALUE grpc_rb_prefork(VALUE self) {
     grpc_rb_event_queue_thread_stop();
     // all ruby-level background threads joined at this point
     g_bg_thread_init_done = false;
+    g_bg_thread_init_was_done = true;
   }
   rb_mutex_unlock(g_bg_thread_init_rb_mu);
   return Qnil;
@@ -413,8 +415,11 @@ static VALUE grpc_rb_postfork_child(VALUE self) {
              "GRPC.postfork_child must be called only from the child process "
              "after a fork");
   }
-  grpc_ruby_reset_init_state();
-  grpc_ruby_init_threads();
+  if (g_bg_thread_init_was_done) {
+      grpc_ruby_reset_init_state();
+      grpc_ruby_init_threads();
+      g_bg_thread_init_was_done = false;
+  }
   g_grpc_rb_prefork_pending = false;
   return Qnil;
 }
