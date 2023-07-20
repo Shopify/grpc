@@ -25,6 +25,7 @@ grpc_pollset_vtable* grpc_pollset_impl;
 void grpc_set_pollset_vtable(grpc_pollset_vtable* vtable) {
   fprintf(stderr, "[GRPC] grpc_set_pollset_vtable(%p)\n", vtable);
   grpc_pollset_impl = vtable;
+  fprintf(stderr, "[GRPC] grpc_pollset_impl->pollset_size = %p\n", grpc_pollset_impl->pollset_size);
 }
 
 void grpc_pollset_global_init() { grpc_pollset_impl->global_init(); }
