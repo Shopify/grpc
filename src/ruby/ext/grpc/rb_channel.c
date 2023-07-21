@@ -833,7 +833,7 @@ void grpc_rb_channel_polling_thread_start() {
       &stop_waiting_for_thread_start,
       wait_until_channel_polling_thread_started_unblocking_func,
       &stop_waiting_for_thread_start);
- }
+}
 
 void grpc_rb_channel_polling_thread_stop() {
   if (!RTEST(g_channel_polling_thread)) {
