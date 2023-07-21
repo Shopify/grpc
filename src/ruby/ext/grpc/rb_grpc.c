@@ -26,6 +26,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #include "rb_call.h"
 #include "rb_call_credentials.h"
@@ -261,6 +262,7 @@ static bool grpc_ruby_initial_thread(void) {
 static void grpc_ruby_reset_init_state(void) {
   g_init_pid = getpid();
   g_init_tid = sys_gettid();
+  fprintf(stderr, "grpc_ruby_reset_init_state g_init_tid = %ld\n", g_init_tid);
 }
 
 static void grpc_ruby_basic_init(void) {
@@ -430,6 +432,7 @@ static VALUE grpc_rb_postfork_parent(VALUE self) {
              "GRPC::prefork");
   }
   if (!grpc_ruby_initial_thread()) {
+      fprintf(stderr, "grpc_rb_postfork_parent g_init_tid = %ld, current_tid=%ld\n", g_init_tid, sys_gettid());
     rb_raise(rb_eRuntimeError,
              "GRPC.postfork_parent needs to be called from the same thread "
              "that GRPC.prefork (and fork) was called from");
