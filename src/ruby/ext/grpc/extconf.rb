@@ -228,22 +228,22 @@ File.open('Makefile.new', 'w') do |o|
 end
 File.rename('Makefile.new', 'Makefile')
 
-if grpc_config == 'opt'
-  File.open('Makefile.new', 'w') do |o|
-    o.puts 'hijack: all strip'
-    o.puts
-    o.write(File.read('Makefile'))
-    o.puts
-    o.puts 'strip: $(DLLIB)'
-    if debug_symbols_output_dir
-      o.puts "\t$(ECHO) Saving debug symbols in #{debug_symbols_output_dir}/#{debug_symbols}"
-      o.puts "\t$(Q) objcopy --only-keep-debug $(DLLIB) #{debug_symbols_output_dir}/#{debug_symbols}"
-    end
-    o.puts "\t$(ECHO) Stripping $(DLLIB)"
-    o.puts "\t$(Q) #{strip_tool} $(DLLIB)"
-  end
-  File.rename('Makefile.new', 'Makefile')
-end
+# if grpc_config == 'opt'
+#   File.open('Makefile.new', 'w') do |o|
+#     o.puts 'hijack: all strip'
+#     o.puts
+#     o.write(File.read('Makefile'))
+#     o.puts
+#     o.puts 'strip: $(DLLIB)'
+#     if debug_symbols_output_dir
+#       o.puts "\t$(ECHO) Saving debug symbols in #{debug_symbols_output_dir}/#{debug_symbols}"
+#       o.puts "\t$(Q) objcopy --only-keep-debug $(DLLIB) #{debug_symbols_output_dir}/#{debug_symbols}"
+#     end
+#     o.puts "\t$(ECHO) Stripping $(DLLIB)"
+#     o.puts "\t$(Q) #{strip_tool} $(DLLIB)"
+#   end
+#   File.rename('Makefile.new', 'Makefile')
+# end
 
 if ENV['GRPC_RUBY_TEST_ONLY_WORKAROUND_MAKE_INSTALL_BUG']
   # Note: this env var setting is intended to work around a problem observed
