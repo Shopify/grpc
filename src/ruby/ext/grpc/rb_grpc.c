@@ -453,6 +453,15 @@ static VALUE grpc_rb_fork_unsafe_begin_api() { grpc_rb_fork_unsafe_begin(); }
 
 static VALUE grpc_rb_fork_unsafe_end_api() { grpc_rb_fork_unsafe_end(); }
 
+static void grpc_rb_segfault_internal(int * p) {
+  printf("%x", *p);
+}
+
+static VALUE grpc_rb_segfault(VALUE self) {
+  grpc_rb_segfault_internal(NULL);
+  return Qnil;
+}
+
 // One-time initialization
 void Init_grpc_c() {
   if (!grpc_rb_load_core()) {
@@ -484,6 +493,7 @@ void Init_grpc_c() {
   Init_grpc_time_consts();
   Init_grpc_compression_options();
   // define fork APIs
+  rb_define_module_function(grpc_rb_mGRPC, "segfault", grpc_rb_segfault, 0);
   rb_define_module_function(grpc_rb_mGRPC, "prefork", grpc_rb_prefork, 0);
   rb_define_module_function(grpc_rb_mGRPC, "postfork_child",
                             grpc_rb_postfork_child, 0);
