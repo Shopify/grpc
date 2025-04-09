@@ -491,7 +491,8 @@ void Init_grpc_c() {
   Init_grpc_time_consts();
   Init_grpc_compression_options();
   // define fork APIs
-  rb_define_module_function(grpc_rb_mGRPC, "init_threads", grpc_rb_init_threads, 0);
+  rb_define_module_function(grpc_rb_mGRPC, "init_threads", grpc_rb_init_threads,
+                            0);
   rb_define_module_function(grpc_rb_mGRPC, "prefork", grpc_rb_prefork, 0);
   rb_define_module_function(grpc_rb_mGRPC, "postfork_child",
                             grpc_rb_postfork_child, 0);
