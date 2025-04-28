@@ -57,9 +57,7 @@ static rb_data_type_t grpc_rb_timespec_data_type = {
      {NULL, NULL}},
     NULL,
     NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
     RUBY_TYPED_FREE_IMMEDIATELY
-#endif
 };
 
 /* Alloc func that blocks allocation of a given object by raising an

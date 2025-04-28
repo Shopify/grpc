@@ -188,9 +188,7 @@ static rb_data_type_t grpc_channel_data_type = {"grpc_channel",
                                                  {NULL, NULL}},
                                                 NULL,
                                                 NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
                                                 RUBY_TYPED_FREE_IMMEDIATELY
-#endif
 };
 
 /* Allocates grpc_rb_channel instances. */

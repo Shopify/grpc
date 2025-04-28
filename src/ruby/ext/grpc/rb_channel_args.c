@@ -36,9 +36,7 @@ static rb_data_type_t grpc_rb_channel_args_data_type = {
      {NULL, NULL}},
     NULL,
     NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
     RUBY_TYPED_FREE_IMMEDIATELY
-#endif
 };
 
 /* A callback the processes the hash key values in channel_args hash */

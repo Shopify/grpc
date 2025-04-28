@@ -222,9 +222,7 @@ static rb_data_type_t grpc_rb_call_credentials_data_type = {
      {NULL, NULL}},
     NULL,
     NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
     RUBY_TYPED_FREE_IMMEDIATELY
-#endif
 };
 
 /* Allocates CallCredentials instances.
