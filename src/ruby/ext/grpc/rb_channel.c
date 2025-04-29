@@ -69,7 +69,8 @@ typedef struct bg_watched_channel {
 
 /* grpc_rb_channel wraps a grpc_channel. */
 typedef struct grpc_rb_channel {
-  /* Ruby VALUE that must be written using RB_OBJ_WRITE for proper write barriers */
+  /* Ruby VALUE that must be written using RB_OBJ_WRITE for proper write
+   * barriers */
   VALUE credentials;
   grpc_channel_args args;
   /* The actual channel (protected in a wrapper to tell when it's safe to
@@ -182,15 +183,15 @@ static void grpc_rb_channel_mark(void* p) {
   }
 }
 
-static rb_data_type_t grpc_channel_data_type = {"grpc_channel",
-                                                {grpc_rb_channel_mark,
-                                                 grpc_rb_channel_free,
-                                                 GRPC_RB_MEMSIZE_UNAVAILABLE,
-                                                 {NULL, NULL}},
-                                                NULL,
-                                                NULL,
-                                                RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
-};
+static rb_data_type_t grpc_channel_data_type = {
+    "grpc_channel",
+    {grpc_rb_channel_mark,
+     grpc_rb_channel_free,
+     GRPC_RB_MEMSIZE_UNAVAILABLE,
+     {NULL, NULL}},
+    NULL,
+    NULL,
+    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED};
 
 /* Allocates grpc_rb_channel instances. */
 static VALUE grpc_rb_channel_alloc(VALUE cls) {
