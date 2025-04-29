@@ -85,9 +85,7 @@ static const rb_data_type_t grpc_rb_xds_server_credentials_data_type = {
      GRPC_RB_MEMSIZE_UNAVAILABLE, NULL},
     NULL,
     NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
     RUBY_TYPED_FREE_IMMEDIATELY
-#endif
 };
 
 /* Allocates ServerCredential instances.

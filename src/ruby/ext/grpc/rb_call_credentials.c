@@ -40,7 +40,8 @@ static VALUE grpc_rb_cCallCredentials = Qnil;
  * object that is used to hold references to any objects used to create the
  * credentials. */
 typedef struct grpc_rb_call_credentials {
-  /* Holder of ruby objects involved in contructing the credentials */
+  /* Holder of ruby objects involved in contructing the credentials.
+     Must be written using RB_OBJ_WRITE for proper write barriers */
   VALUE mark;
 
   /* The actual credentials */
@@ -171,6 +172,8 @@ static int grpc_rb_call_credentials_plugin_get_metadata(
     size_t* num_creds_md, grpc_status_code* status,
     const char** error_details) {
   callback_params* params = gpr_zalloc(sizeof(callback_params));
+  // FIXME: do we need to call a gc function for this VALUE?  This
+  // callback_params doesn't have a corresponding rb_data_type_t.
   params->get_metadata = (VALUE)state;
   grpc_auth_metadata_context_copy(&context, &params->context);
   params->user_data = user_data;
@@ -222,9 +225,7 @@ static rb_data_type_t grpc_rb_call_credentials_data_type = {
      {NULL, NULL}},
     NULL,
     NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
-    RUBY_TYPED_FREE_IMMEDIATELY
-#endif
+    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
 };
 
 /* Allocates CallCredentials instances.
@@ -251,7 +252,7 @@ VALUE grpc_rb_wrap_call_credentials(grpc_call_credentials* c, VALUE mark) {
   TypedData_Get_Struct(rb_wrapper, grpc_rb_call_credentials,
                        &grpc_rb_call_credentials_data_type, wrapper);
   wrapper->wrapped = c;
-  wrapper->mark = mark;
+  RB_OBJ_WRITE(rb_wrapper, &wrapper->mark, mark);
   return rb_wrapper;
 }
 
@@ -289,7 +290,7 @@ static VALUE grpc_rb_call_credentials_init(VALUE self, VALUE proc) {
     return Qnil;
   }
 
-  wrapper->mark = proc;
+  RB_OBJ_WRITE(self, &wrapper->mark, proc);
   wrapper->wrapped = creds;
   rb_ivar_set(self, id_callback, proc);
 

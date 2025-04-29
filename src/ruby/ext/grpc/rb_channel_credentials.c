@@ -41,7 +41,8 @@ static char* pem_root_certs = NULL;
  * mark object that is used to hold references to any objects used to create
  * the credentials. */
 typedef struct grpc_rb_channel_credentials {
-  /* Holder of ruby objects involved in constructing the credentials */
+  /* Holder of ruby objects involved in constructing the credentials.
+     Must be written using RB_OBJ_WRITE for proper write barriers */
   VALUE mark;
 
   /* The actual credentials */
@@ -86,9 +87,7 @@ static rb_data_type_t grpc_rb_channel_credentials_data_type = {
      {NULL, NULL}},
     NULL,
     NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
-    RUBY_TYPED_FREE_IMMEDIATELY
-#endif
+    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
 };
 
 /* Allocates ChannelCredential instances.
@@ -116,7 +115,7 @@ VALUE grpc_rb_wrap_channel_credentials(grpc_channel_credentials* c,
   TypedData_Get_Struct(rb_wrapper, grpc_rb_channel_credentials,
                        &grpc_rb_channel_credentials_data_type, wrapper);
   wrapper->wrapped = c;
-  wrapper->mark = mark;
+  RB_OBJ_WRITE(rb_wrapper, &wrapper->mark, mark);
   return rb_wrapper;
 }
 

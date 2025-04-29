@@ -69,6 +69,7 @@ typedef struct bg_watched_channel {
 
 /* grpc_rb_channel wraps a grpc_channel. */
 typedef struct grpc_rb_channel {
+  /* Ruby VALUE that must be written using RB_OBJ_WRITE for proper write barriers */
   VALUE credentials;
   grpc_channel_args args;
   /* The actual channel (protected in a wrapper to tell when it's safe to
@@ -188,9 +189,7 @@ static rb_data_type_t grpc_channel_data_type = {"grpc_channel",
                                                  {NULL, NULL}},
                                                 NULL,
                                                 NULL,
-#ifdef RUBY_TYPED_FREE_IMMEDIATELY
-                                                RUBY_TYPED_FREE_IMMEDIATELY
-#endif
+                                                RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
 };
 
 /* Allocates grpc_rb_channel instances. */
@@ -239,7 +238,7 @@ static VALUE grpc_rb_channel_init(int argc, VALUE* argv, VALUE self) {
     ch = grpc_channel_create(target_chars, insecure_creds, &wrapper->args);
     grpc_channel_credentials_release(insecure_creds);
   } else {
-    wrapper->credentials = credentials;
+    RB_OBJ_WRITE(self, &wrapper->credentials, credentials);
     if (grpc_rb_is_channel_credentials(credentials)) {
       creds = grpc_rb_get_wrapped_channel_credentials(credentials);
     } else if (grpc_rb_is_xds_channel_credentials(credentials)) {
