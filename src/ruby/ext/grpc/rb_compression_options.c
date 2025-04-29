@@ -80,8 +80,7 @@ static rb_data_type_t grpc_rb_compression_options_data_type = {
      {NULL, NULL}},
     NULL,
     NULL,
-    RUBY_TYPED_FREE_IMMEDIATELY
-};
+    RUBY_TYPED_FREE_IMMEDIATELY};
 
 /* Allocates CompressionOptions instances.
    Allocate the wrapped grpc compression options and

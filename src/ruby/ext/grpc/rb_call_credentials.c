@@ -225,8 +225,7 @@ static rb_data_type_t grpc_rb_call_credentials_data_type = {
      {NULL, NULL}},
     NULL,
     NULL,
-    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
-};
+    RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED};
 
 /* Allocates CallCredentials instances.
    Provides safe initial defaults for the instance fields. */

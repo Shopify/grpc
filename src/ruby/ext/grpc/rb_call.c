@@ -127,8 +127,7 @@ static const rb_data_type_t grpc_call_data_type = {"grpc_call",
                                                     {NULL, NULL}},
                                                    NULL,
                                                    NULL,
-                                                   RUBY_TYPED_FREE_IMMEDIATELY
-};
+                                                   RUBY_TYPED_FREE_IMMEDIATELY};
 
 /* Error code details is a hash containing text strings describing errors */
 VALUE rb_error_code_details;
