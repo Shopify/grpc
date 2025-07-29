@@ -84,7 +84,8 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     }
   }
   if (event->pid != getpid()) {
-    fprintf(stderr, "DEQUEUED EVENT PID %d != CURRENT PID %d\n", event->pid, getpid());
+    fprintf(stderr, "DEQUEUED EVENT PID %d != CURRENT PID %d\n", event->pid,
+            getpid());
   }
   return event;
 }
