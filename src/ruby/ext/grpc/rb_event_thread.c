@@ -36,6 +36,7 @@ typedef struct grpc_rb_event {
   void* argument;
 
   struct grpc_rb_event* next;
+  pid_t pid;
 } grpc_rb_event;
 
 typedef struct grpc_rb_event_queue {
@@ -57,6 +58,7 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   grpc_rb_event* event = gpr_malloc(sizeof(grpc_rb_event));
   event->callback = callback;
   event->argument = argument;
+  event->pid = getpid();
   event->next = NULL;
   gpr_mu_lock(&event_queue.mu);
   if (event_queue.tail == NULL) {
@@ -80,6 +82,12 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     } else {
       event_queue.head = event_queue.head->next;
     }
+  }
+  if (event != NULL) {
+    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\n", event->pid, (event->pid == getpid() ? "==" : "!="), getpid());
+  }
+  else {
+    fprintf(stderr, "DEQUEUED EVENT IS NULL\n");
   }
   return event;
 }
