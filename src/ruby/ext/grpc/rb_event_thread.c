@@ -84,9 +84,9 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     }
   }
   if (event != NULL) {
-    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\n", event->pid, (event->pid == getpid() ? "==" : "!="), getpid());
-  }
-  else {
+    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\n", event->pid,
+            (event->pid == getpid() ? "==" : "!="), getpid());
+  } else {
     fprintf(stderr, "DEQUEUED EVENT IS NULL\n");
   }
   return event;
