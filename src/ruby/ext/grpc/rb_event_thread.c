@@ -69,7 +69,8 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   // Capture backtrace using Ruby's caller functionality
   VALUE caller_array = rb_funcall(rb_mKernel, rb_intern("caller"), 0);
   if (caller_array != Qnil && RARRAY_LEN(caller_array) > 0) {
-    VALUE backtrace_str = rb_funcall(caller_array, rb_intern("join"), 1, rb_str_new2("\n"));
+    VALUE backtrace_str =
+        rb_funcall(caller_array, rb_intern("join"), 1, rb_str_new2("\n"));
     const char* bt_cstr = StringValueCStr(backtrace_str);
     event->ruby_backtrace = gpr_malloc(strlen(bt_cstr) + 1);
     strcpy(event->ruby_backtrace, bt_cstr);
@@ -86,9 +87,9 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   if (strings != NULL) {
     size_t total_len = 0;
     for (int i = 0; i < nptrs; i++) {
-      total_len += strlen(strings[i]) + 1; // +1 for newline
+      total_len += strlen(strings[i]) + 1;  // +1 for newline
     }
-    event->c_backtrace = gpr_malloc(total_len + 1); // +1 for null terminator
+    event->c_backtrace = gpr_malloc(total_len + 1);  // +1 for null terminator
     event->c_backtrace[0] = '\0';
     for (int i = 0; i < nptrs; i++) {
       strcat(event->c_backtrace, strings[i]);
@@ -100,7 +101,8 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
     strcpy(event->c_backtrace, "no C backtrace available");
   }
 #else
-  event->c_backtrace = gpr_malloc(strlen("C backtrace not supported on this platform") + 1);
+  event->c_backtrace =
+      gpr_malloc(strlen("C backtrace not supported on this platform") + 1);
   strcpy(event->c_backtrace, "C backtrace not supported on this platform");
 #endif
 
@@ -129,11 +131,12 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     }
   }
   if (event != NULL) {
-    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\nRUBY BACKTRACE:\n%s\nC BACKTRACE:\n%s\n",
-            event->pid, (event->pid == getpid() ? "==" : "!="), getpid(), 
+    fprintf(stderr,
+            "DEQUEUED EVENT PID %d %s CURRENT PID %d\nRUBY BACKTRACE:\n%s\nC "
+            "BACKTRACE:\n%s\n",
+            event->pid, (event->pid == getpid() ? "==" : "!="), getpid(),
             event->ruby_backtrace, event->c_backtrace);
-  }
-  else {
+  } else {
     fprintf(stderr, "DEQUEUED EVENT IS NULL\n");
   }
   return event;
