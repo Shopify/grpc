@@ -65,21 +65,40 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   event->argument = argument;
   event->pid = getpid();
 
-  // Capture C backtrace
+  // Capture C backtrace with enhanced formatting
 #ifdef __GLIBC__
-  void* buffer[256];
-  int nptrs = backtrace(buffer, 256);
+  void* buffer[64];  // Reduced to 64 for more manageable output
+  int nptrs = backtrace(buffer, 64);
   char** strings = backtrace_symbols(buffer, nptrs);
-  if (strings != NULL) {
-    size_t total_len = 0;
+  if (strings != NULL && nptrs > 0) {
+    size_t total_len = 100; // Header space
     for (int i = 0; i < nptrs; i++) {
-      total_len += strlen(strings[i]) + 1; // +1 for newline
+      total_len += strlen(strings[i]) + 50; // Extra space for formatting
     }
-    event->c_backtrace = gpr_malloc(total_len + 1); // +1 for null terminator
-    event->c_backtrace[0] = '\0';
+    event->c_backtrace = gpr_malloc(total_len);
+    snprintf(event->c_backtrace, total_len, "C Stack Trace (%d frames):\n", nptrs);
+    
     for (int i = 0; i < nptrs; i++) {
-      strcat(event->c_backtrace, strings[i]);
-      if (i < nptrs - 1) strcat(event->c_backtrace, "\n");
+      char frame_info[512];
+      // Extract function name from symbol string if available
+      char* symbol = strings[i];
+      char* func_start = strchr(symbol, '(');
+      char* func_end = strchr(symbol, '+');
+      
+      if (func_start && func_end && func_end > func_start) {
+        // Extract function name
+        int func_len = func_end - func_start - 1;
+        char func_name[256];
+        strncpy(func_name, func_start + 1, func_len);
+        func_name[func_len] = '\0';
+        
+        snprintf(frame_info, sizeof(frame_info), "#%-2d %p in %s (%s)\n", 
+                i, buffer[i], func_name[0] ? func_name : "??", symbol);
+      } else {
+        snprintf(frame_info, sizeof(frame_info), "#%-2d %p (%s)\n", 
+                i, buffer[i], symbol);
+      }
+      strncat(event->c_backtrace, frame_info, total_len - strlen(event->c_backtrace) - 1);
     }
     free(strings);
   } else {
