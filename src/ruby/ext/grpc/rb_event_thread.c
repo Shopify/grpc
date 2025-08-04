@@ -26,6 +26,10 @@
 #include <grpc/support/time.h>
 #include <ruby/thread.h>
 #include <stdbool.h>
+#include <string.h>
+#ifdef __GLIBC__
+#include <execinfo.h>
+#endif
 
 #include "rb_grpc.h"
 #include "rb_grpc_imports.generated.h"
@@ -37,6 +41,7 @@ typedef struct grpc_rb_event {
 
   struct grpc_rb_event* next;
   pid_t pid;
+  char* c_backtrace;
 } grpc_rb_event;
 
 typedef struct grpc_rb_event_queue {
@@ -59,6 +64,33 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   event->callback = callback;
   event->argument = argument;
   event->pid = getpid();
+
+  // Capture C backtrace
+#ifdef __GLIBC__
+  void* buffer[256];
+  int nptrs = backtrace(buffer, 256);
+  char** strings = backtrace_symbols(buffer, nptrs);
+  if (strings != NULL) {
+    size_t total_len = 0;
+    for (int i = 0; i < nptrs; i++) {
+      total_len += strlen(strings[i]) + 1; // +1 for newline
+    }
+    event->c_backtrace = gpr_malloc(total_len + 1); // +1 for null terminator
+    event->c_backtrace[0] = '\0';
+    for (int i = 0; i < nptrs; i++) {
+      strcat(event->c_backtrace, strings[i]);
+      if (i < nptrs - 1) strcat(event->c_backtrace, "\n");
+    }
+    free(strings);
+  } else {
+    event->c_backtrace = gpr_malloc(strlen("no C backtrace available") + 1);
+    strcpy(event->c_backtrace, "no C backtrace available");
+  }
+#else
+  event->c_backtrace = gpr_malloc(strlen("C backtrace not supported on this platform") + 1);
+  strcpy(event->c_backtrace, "C backtrace not supported on this platform");
+#endif
+
   event->next = NULL;
   gpr_mu_lock(&event_queue.mu);
   if (event_queue.tail == NULL) {
@@ -84,7 +116,9 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     }
   }
   if (event != NULL) {
-    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\n", event->pid, (event->pid == getpid() ? "==" : "!="), getpid());
+    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\nC BACKTRACE:\n%s\n",
+            event->pid, (event->pid == getpid() ? "==" : "!="), getpid(), 
+            event->c_backtrace);
   }
   else {
     fprintf(stderr, "DEQUEUED EVENT IS NULL\n");
@@ -140,6 +174,7 @@ static VALUE grpc_rb_event_thread(void* arg) {
       break;
     } else {
       event->callback(event->argument);
+      gpr_free(event->c_backtrace);
       gpr_free(event);
     }
   }
