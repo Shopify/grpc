@@ -29,6 +29,7 @@
 #include <string.h>
 #ifdef __GLIBC__
 #include <execinfo.h>
+#include <dlfcn.h>
 #endif
 
 #include "rb_grpc.h"
@@ -65,38 +66,64 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   event->argument = argument;
   event->pid = getpid();
 
-  // Capture C backtrace with enhanced formatting
+  // Capture C backtrace with enhanced formatting and debug symbols
 #ifdef __GLIBC__
-  void* buffer[64];  // Reduced to 64 for more manageable output
-  int nptrs = backtrace(buffer, 64);
+  void* buffer[32];  // Reduced for cleaner output with source info
+  int nptrs = backtrace(buffer, 32);
   char** strings = backtrace_symbols(buffer, nptrs);
   if (strings != NULL && nptrs > 0) {
-    size_t total_len = 100; // Header space
+    size_t total_len = 200; // Header space
     for (int i = 0; i < nptrs; i++) {
-      total_len += strlen(strings[i]) + 50; // Extra space for formatting
+      total_len += 1024; // Much more space for source file info
     }
     event->c_backtrace = gpr_malloc(total_len);
     snprintf(event->c_backtrace, total_len, "C Stack Trace (%d frames):\n", nptrs);
     
     for (int i = 0; i < nptrs; i++) {
-      char frame_info[512];
-      // Extract function name from symbol string if available
-      char* symbol = strings[i];
-      char* func_start = strchr(symbol, '(');
-      char* func_end = strchr(symbol, '+');
+      char frame_info[1024];
+      void* addr = buffer[i];
+      Dl_info dlinfo;
       
-      if (func_start && func_end && func_end > func_start) {
-        // Extract function name
-        int func_len = func_end - func_start - 1;
-        char func_name[256];
-        strncpy(func_name, func_start + 1, func_len);
-        func_name[func_len] = '\0';
+      // Use dladdr for better symbol resolution
+      if (dladdr(addr, &dlinfo)) {
+        const char* fname = dlinfo.dli_fname ? dlinfo.dli_fname : "??";
+        const char* sname = dlinfo.dli_sname ? dlinfo.dli_sname : "??";
         
-        snprintf(frame_info, sizeof(frame_info), "#%-2d %p in %s (%s)\n", 
-                i, buffer[i], func_name[0] ? func_name : "??", symbol);
+        // Try to get source file and line using addr2line
+        char cmd[512];
+        char source_info[256] = "";
+        
+        if (dlinfo.dli_fname) {
+          // Calculate offset from base address
+          void* offset = (void*)((char*)addr - (char*)dlinfo.dli_fbase);
+          snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C %p 2>/dev/null", 
+                  dlinfo.dli_fname, offset);
+          
+          FILE* fp = popen(cmd, "r");
+          if (fp) {
+            char func_line[128];
+            char file_line[128];
+            if (fgets(func_line, sizeof(func_line), fp) && 
+                fgets(file_line, sizeof(file_line), fp)) {
+              // Remove newlines
+              func_line[strcspn(func_line, "\n")] = 0;
+              file_line[strcspn(file_line, "\n")] = 0;
+              
+              if (strcmp(file_line, "??:0") != 0) {
+                snprintf(source_info, sizeof(source_info), " at %s", file_line);
+              }
+            }
+            pclose(fp);
+          }
+        }
+        
+        snprintf(frame_info, sizeof(frame_info), 
+                "#%-2d %p in %s (%s)%s\n", 
+                i, addr, sname, fname, source_info);
       } else {
+        // Fallback to backtrace_symbols output
         snprintf(frame_info, sizeof(frame_info), "#%-2d %p (%s)\n", 
-                i, buffer[i], symbol);
+                i, addr, strings[i]);
       }
       strncat(event->c_backtrace, frame_info, total_len - strlen(event->c_backtrace) - 1);
     }
