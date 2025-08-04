@@ -72,54 +72,27 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   int nptrs = backtrace(buffer, 32);
   char** strings = backtrace_symbols(buffer, nptrs);
   if (strings != NULL && nptrs > 0) {
-    size_t total_len = 200; // Header space
+    size_t total_len = 100; // Header space
     for (int i = 0; i < nptrs; i++) {
-      total_len += 1024; // Much more space for source file info
+      total_len += 256; // Space for function names and offsets
     }
     event->c_backtrace = gpr_malloc(total_len);
     snprintf(event->c_backtrace, total_len, "C Stack Trace (%d frames):\n", nptrs);
     
     for (int i = 0; i < nptrs; i++) {
-      char frame_info[1024];
+      char frame_info[256];
       void* addr = buffer[i];
       Dl_info dlinfo;
       
-      // Use dladdr for better symbol resolution
+      // Use dladdr for fast symbol resolution (no slow addr2line calls)
       if (dladdr(addr, &dlinfo)) {
         const char* fname = dlinfo.dli_fname ? dlinfo.dli_fname : "??";
         const char* sname = dlinfo.dli_sname ? dlinfo.dli_sname : "??";
-        
-        // Try to get source file and line using addr2line
-        char cmd[512];
-        char source_info[256] = "";
-        
-        if (dlinfo.dli_fname) {
-          // Calculate offset from base address
-          void* offset = (void*)((char*)addr - (char*)dlinfo.dli_fbase);
-          snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C %p 2>/dev/null", 
-                  dlinfo.dli_fname, offset);
-          
-          FILE* fp = popen(cmd, "r");
-          if (fp) {
-            char func_line[128];
-            char file_line[128];
-            if (fgets(func_line, sizeof(func_line), fp) && 
-                fgets(file_line, sizeof(file_line), fp)) {
-              // Remove newlines
-              func_line[strcspn(func_line, "\n")] = 0;
-              file_line[strcspn(file_line, "\n")] = 0;
-              
-              if (strcmp(file_line, "??:0") != 0) {
-                snprintf(source_info, sizeof(source_info), " at %s", file_line);
-              }
-            }
-            pclose(fp);
-          }
-        }
+        void* offset = (void*)((char*)addr - (char*)dlinfo.dli_fbase);
         
         snprintf(frame_info, sizeof(frame_info), 
-                "#%-2d %p in %s (%s)%s\n", 
-                i, addr, sname, fname, source_info);
+                "#%-2d %p in %s+0x%lx (%s)\n", 
+                i, addr, sname, (long)offset, fname);
       } else {
         // Fallback to backtrace_symbols output
         snprintf(frame_info, sizeof(frame_info), "#%-2d %p (%s)\n", 
