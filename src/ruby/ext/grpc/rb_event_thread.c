@@ -26,6 +26,7 @@
 #include <grpc/support/time.h>
 #include <ruby/thread.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "rb_grpc.h"
 #include "rb_grpc_imports.generated.h"
@@ -37,6 +38,7 @@ typedef struct grpc_rb_event {
 
   struct grpc_rb_event* next;
   pid_t pid;
+  char* ruby_backtrace;
 } grpc_rb_event;
 
 typedef struct grpc_rb_event_queue {
@@ -59,6 +61,19 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   event->callback = callback;
   event->argument = argument;
   event->pid = getpid();
+
+  // Capture backtrace using Ruby's caller functionality
+  VALUE caller_array = rb_funcall(rb_mKernel, rb_intern("caller"), 0);
+  if (caller_array != Qnil && RARRAY_LEN(caller_array) > 0) {
+    VALUE backtrace_str = rb_funcall(caller_array, rb_intern("join"), 1, rb_str_new2("\n"));
+    const char* bt_cstr = StringValueCStr(backtrace_str);
+    event->ruby_backtrace = gpr_malloc(strlen(bt_cstr) + 1);
+    strcpy(event->ruby_backtrace, bt_cstr);
+  } else {
+    event->ruby_backtrace = gpr_malloc(strlen("no backtrace available") + 1);
+    strcpy(event->ruby_backtrace, "no backtrace available");
+  }
+
   event->next = NULL;
   gpr_mu_lock(&event_queue.mu);
   if (event_queue.tail == NULL) {
@@ -84,7 +99,8 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     }
   }
   if (event != NULL) {
-    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\n", event->pid, (event->pid == getpid() ? "==" : "!="), getpid());
+    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\nBACKTRACE:\n%s\n",
+            event->pid, (event->pid == getpid() ? "==" : "!="), getpid(), event->ruby_backtrace);
   }
   else {
     fprintf(stderr, "DEQUEUED EVENT IS NULL\n");
@@ -140,6 +156,7 @@ static VALUE grpc_rb_event_thread(void* arg) {
       break;
     } else {
       event->callback(event->argument);
+      gpr_free(event->ruby_backtrace);
       gpr_free(event);
     }
   }
