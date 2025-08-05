@@ -174,7 +174,7 @@ static int grpc_rb_call_credentials_plugin_get_metadata(
   params->get_metadata = (VALUE)state;
 
   const char* should_mark = getenv("GRPC_MARK_CC_PARAMS");
-  if(should_mark != NULL && strcmp(should_mark, "1") == 0){
+  if (should_mark != NULL && strcmp(should_mark, "1") == 0) {
     rb_gc_mark(params->get_metadata);
   }
 
