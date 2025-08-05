@@ -172,6 +172,12 @@ static int grpc_rb_call_credentials_plugin_get_metadata(
     const char** error_details) {
   callback_params* params = gpr_zalloc(sizeof(callback_params));
   params->get_metadata = (VALUE)state;
+
+  const char* should_mark = getenv("GRPC_MARK_CC_PARAMS");
+  if(should_mark != NULL && strcmp(should_mark, "1") == 0){
+    rb_gc_mark(params->get_metadata);
+  }
+
   grpc_auth_metadata_context_copy(&context, &params->context);
   params->user_data = user_data;
   params->callback = cb;
