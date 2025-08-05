@@ -28,8 +28,8 @@
 #include <stdbool.h>
 #include <string.h>
 #ifdef __GLIBC__
-#include <execinfo.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #endif
 
 #include "rb_grpc.h"
@@ -72,33 +72,34 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   int nptrs = backtrace(buffer, 32);
   char** strings = backtrace_symbols(buffer, nptrs);
   if (strings != NULL && nptrs > 0) {
-    size_t total_len = 100; // Header space
+    size_t total_len = 100;  // Header space
     for (int i = 0; i < nptrs; i++) {
-      total_len += 256; // Space for function names and offsets
+      total_len += 256;  // Space for function names and offsets
     }
     event->c_backtrace = gpr_malloc(total_len);
-    snprintf(event->c_backtrace, total_len, "C Stack Trace (%d frames):\n", nptrs);
-    
+    snprintf(event->c_backtrace, total_len, "C Stack Trace (%d frames):\n",
+             nptrs);
+
     for (int i = 0; i < nptrs; i++) {
       char frame_info[256];
       void* addr = buffer[i];
       Dl_info dlinfo;
-      
+
       // Use dladdr for fast symbol resolution (no slow addr2line calls)
       if (dladdr(addr, &dlinfo)) {
         const char* fname = dlinfo.dli_fname ? dlinfo.dli_fname : "??";
         const char* sname = dlinfo.dli_sname ? dlinfo.dli_sname : "??";
         void* offset = (void*)((char*)addr - (char*)dlinfo.dli_fbase);
-        
-        snprintf(frame_info, sizeof(frame_info), 
-                "#%-2d %p in %s+0x%lx (%s)\n", 
-                i, addr, sname, (long)offset, fname);
+
+        snprintf(frame_info, sizeof(frame_info), "#%-2d %p in %s+0x%lx (%s)\n",
+                 i, addr, sname, (long)offset, fname);
       } else {
         // Fallback to backtrace_symbols output
-        snprintf(frame_info, sizeof(frame_info), "#%-2d %p (%s)\n", 
-                i, addr, strings[i]);
+        snprintf(frame_info, sizeof(frame_info), "#%-2d %p (%s)\n", i, addr,
+                 strings[i]);
       }
-      strncat(event->c_backtrace, frame_info, total_len - strlen(event->c_backtrace) - 1);
+      strncat(event->c_backtrace, frame_info,
+              total_len - strlen(event->c_backtrace) - 1);
     }
     free(strings);
   } else {
@@ -106,7 +107,8 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
     strcpy(event->c_backtrace, "no C backtrace available");
   }
 #else
-  event->c_backtrace = gpr_malloc(strlen("C backtrace not supported on this platform") + 1);
+  event->c_backtrace =
+      gpr_malloc(strlen("C backtrace not supported on this platform") + 1);
   strcpy(event->c_backtrace, "C backtrace not supported on this platform");
 #endif
 
@@ -135,11 +137,11 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     }
   }
   if (event != NULL) {
-    fprintf(stderr, "DEQUEUED EVENT PID %d %s CURRENT PID %d\nC BACKTRACE:\n%s\n",
-            event->pid, (event->pid == getpid() ? "==" : "!="), getpid(), 
+    fprintf(stderr,
+            "DEQUEUED EVENT PID %d %s CURRENT PID %d\nC BACKTRACE:\n%s\n",
+            event->pid, (event->pid == getpid() ? "==" : "!="), getpid(),
             event->c_backtrace);
-  }
-  else {
+  } else {
     fprintf(stderr, "DEQUEUED EVENT IS NULL\n");
   }
   return event;
