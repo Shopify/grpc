@@ -26,6 +26,10 @@
 #include <grpc/support/time.h>
 #include <ruby/thread.h>
 #include <stdbool.h>
+#include <string.h>
+#ifdef __GLIBC__
+#include <execinfo.h>
+#endif
 
 #include "rb_grpc.h"
 #include "rb_grpc_imports.generated.h"
@@ -36,6 +40,9 @@ typedef struct grpc_rb_event {
   void* argument;
 
   struct grpc_rb_event* next;
+  pid_t pid;
+  char* ruby_backtrace;
+  char* c_backtrace;
 } grpc_rb_event;
 
 typedef struct grpc_rb_event_queue {
@@ -57,6 +64,48 @@ void grpc_rb_event_queue_enqueue(void (*callback)(void*), void* argument) {
   grpc_rb_event* event = gpr_malloc(sizeof(grpc_rb_event));
   event->callback = callback;
   event->argument = argument;
+  event->pid = getpid();
+
+  // Capture backtrace using Ruby's caller functionality
+  VALUE caller_array = rb_funcall(rb_mKernel, rb_intern("caller"), 0);
+  if (caller_array != Qnil && RARRAY_LEN(caller_array) > 0) {
+    VALUE backtrace_str =
+        rb_funcall(caller_array, rb_intern("join"), 1, rb_str_new2("\n"));
+    const char* bt_cstr = StringValueCStr(backtrace_str);
+    event->ruby_backtrace = gpr_malloc(strlen(bt_cstr) + 1);
+    strcpy(event->ruby_backtrace, bt_cstr);
+  } else {
+    event->ruby_backtrace = gpr_malloc(strlen("no backtrace available") + 1);
+    strcpy(event->ruby_backtrace, "no backtrace available");
+  }
+
+  // Capture C backtrace
+#ifdef __GLIBC__
+  void* buffer[256];
+  int nptrs = backtrace(buffer, 256);
+  char** strings = backtrace_symbols(buffer, nptrs);
+  if (strings != NULL) {
+    size_t total_len = 0;
+    for (int i = 0; i < nptrs; i++) {
+      total_len += strlen(strings[i]) + 1;  // +1 for newline
+    }
+    event->c_backtrace = gpr_malloc(total_len + 1);  // +1 for null terminator
+    event->c_backtrace[0] = '\0';
+    for (int i = 0; i < nptrs; i++) {
+      strcat(event->c_backtrace, strings[i]);
+      if (i < nptrs - 1) strcat(event->c_backtrace, "\n");
+    }
+    free(strings);
+  } else {
+    event->c_backtrace = gpr_malloc(strlen("no C backtrace available") + 1);
+    strcpy(event->c_backtrace, "no C backtrace available");
+  }
+#else
+  event->c_backtrace =
+      gpr_malloc(strlen("C backtrace not supported on this platform") + 1);
+  strcpy(event->c_backtrace, "C backtrace not supported on this platform");
+#endif
+
   event->next = NULL;
   gpr_mu_lock(&event_queue.mu);
   if (event_queue.tail == NULL) {
@@ -80,6 +129,15 @@ static grpc_rb_event* grpc_rb_event_queue_dequeue() {
     } else {
       event_queue.head = event_queue.head->next;
     }
+  }
+  if (event != NULL) {
+    fprintf(stderr,
+            "DEQUEUED EVENT PID %d %s CURRENT PID %d\nRUBY BACKTRACE:\n%s\nC "
+            "BACKTRACE:\n%s\n",
+            event->pid, (event->pid == getpid() ? "==" : "!="), getpid(),
+            event->ruby_backtrace, event->c_backtrace);
+  } else {
+    fprintf(stderr, "DEQUEUED EVENT IS NULL\n");
   }
   return event;
 }
@@ -132,6 +190,8 @@ static VALUE grpc_rb_event_thread(void* arg) {
       break;
     } else {
       event->callback(event->argument);
+      gpr_free(event->ruby_backtrace);
+      gpr_free(event->c_backtrace);
       gpr_free(event);
     }
   }
