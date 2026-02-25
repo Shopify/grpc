@@ -414,6 +414,7 @@ static VALUE grpc_rb_postfork_child(VALUE self) {
              "after a fork");
   }
   grpc_ruby_reset_init_state();
+  grpc_rb_call_credentials_postfork_child();
   grpc_ruby_init_threads();
   g_grpc_rb_prefork_pending = false;
   return Qnil;

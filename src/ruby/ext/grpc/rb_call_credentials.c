@@ -25,6 +25,7 @@
 #include <grpc/grpc_security.h>
 #include <grpc/support/alloc.h>
 #include <grpc/support/log.h>
+#include <grpc/support/sync.h>
 #include <ruby/thread.h>
 
 #include "rb_call.h"
@@ -35,6 +36,65 @@
 /* grpc_rb_cCallCredentials is the ruby class that proxies
  * grpc_call_credentials */
 static VALUE grpc_rb_cCallCredentials = Qnil;
+
+/* plugin_ref ties the lifetime of a Ruby proc used as a gRPC credentials
+ * plugin callback to the lifetime of the underlying C plugin, rather than
+ * to the Ruby wrapper object. This prevents use-after-free when the Ruby
+ * Channel/CallCredentials objects are GC'd but gRPC's C core still holds
+ * a reference to the plugin and may invoke its callback. */
+typedef struct plugin_ref {
+  VALUE proc;
+  struct plugin_ref* next;
+} plugin_ref;
+
+static plugin_ref* active_plugins_states = NULL;
+static gpr_mu active_plugins_states_mu;
+
+/* Register a proc as a value to mark for as long as its C plugin is alive. */
+static plugin_ref* pin_plugin_proc(VALUE proc) {
+  plugin_ref* ref = gpr_zalloc(sizeof(plugin_ref));
+  ref->proc = proc;
+  gpr_mu_lock(&active_plugins_states_mu);
+  ref->next = active_plugins_states;
+  active_plugins_states = ref;
+  gpr_mu_unlock(&active_plugins_states_mu);
+  return ref;
+}
+
+/* Remove a proc from the GC root set when its C plugin is destroyed.
+ * Safe to call from any thread (does not require the GIL). */
+static void unpin_plugin_proc(plugin_ref* ref) {
+  gpr_mu_lock(&active_plugins_states_mu);
+  plugin_ref** pp = &active_plugins_states;
+  while (*pp) {
+    if (*pp == ref) {
+      *pp = ref->next;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  gpr_mu_unlock(&active_plugins_states_mu);
+  gpr_free(ref);
+}
+
+/* GC mark callback for the global plugin marker object. Marks all procs
+ * that are currently in use by active C-level credential plugins. */
+static void grpc_rb_plugin_marker_mark(void* _unused) {
+  (void)_unused;
+  gpr_mu_lock(&active_plugins_states_mu);
+  for (plugin_ref* ref = active_plugins_states; ref; ref = ref->next) {
+    rb_gc_mark(ref->proc);
+  }
+  gpr_mu_unlock(&active_plugins_states_mu);
+}
+
+static const rb_data_type_t grpc_plugin_marker_type = {
+    .wrap_struct_name = "grpc_plugin_marker",
+    .function = {.dmark = grpc_rb_plugin_marker_mark,
+                 .dfree = GRPC_RB_GC_DONT_FREE,
+                 .dsize = GRPC_RB_MEMSIZE_UNAVAILABLE},
+    .flags = 0,
+};
 
 /* grpc_rb_call_credentials wraps a grpc_call_credentials. It provides a mark
  * object that is used to hold references to any objects used to create the
@@ -171,7 +231,7 @@ static int grpc_rb_call_credentials_plugin_get_metadata(
     size_t* num_creds_md, grpc_status_code* status,
     const char** error_details) {
   callback_params* params = gpr_zalloc(sizeof(callback_params));
-  params->get_metadata = (VALUE)state;
+  params->get_metadata = ((plugin_ref*)state)->proc;
   grpc_auth_metadata_context_copy(&context, &params->context);
   params->user_data = user_data;
   params->callback = cb;
@@ -182,8 +242,9 @@ static int grpc_rb_call_credentials_plugin_get_metadata(
 }
 
 static void grpc_rb_call_credentials_plugin_destroy(void* state) {
-  (void)state;
-  // Not sure what needs to be done here
+  if (state != NULL) {
+    unpin_plugin_proc((plugin_ref*)state);
+  }
 }
 
 static void grpc_rb_call_credentials_free_internal(void* p) {
@@ -277,7 +338,8 @@ static VALUE grpc_rb_call_credentials_init(VALUE self, VALUE proc) {
     rb_raise(rb_eTypeError, "Argument to CallCredentials#new must be a proc");
     return Qnil;
   }
-  plugin.state = (void*)proc;
+  plugin_ref* ref = pin_plugin_proc(proc);
+  plugin.state = (void*)ref;
   plugin.type = "";
 
   // TODO(yihuazhang): Expose min_security_level via the Ruby API so that
@@ -285,6 +347,7 @@ static VALUE grpc_rb_call_credentials_init(VALUE self, VALUE proc) {
   creds = grpc_metadata_credentials_create_from_plugin(
       plugin, GRPC_PRIVACY_AND_INTEGRITY, NULL);
   if (creds == NULL) {
+    unpin_plugin_proc(ref);
     rb_raise(rb_eRuntimeError, "could not create a credentials, not sure why");
     return Qnil;
   }
@@ -336,6 +399,35 @@ void Init_grpc_call_credentials() {
                    grpc_rb_call_credentials_compose, -1);
 
   id_callback = rb_intern("__callback");
+
+  /* Initialize the mutex protecting the active plugin list. */
+  gpr_mu_init(&active_plugins_states_mu);
+
+  /* Create a global marker object whose mark and compact callbacks keep
+   * plugin procs alive for as long as their C-level plugins exist.
+   * Stored as an ivar on the class (a GC root via the constant table)
+   * so the marker stays alive without rb_gc_register_address. */
+  VALUE plugin_marker =
+      TypedData_Wrap_Struct(rb_cObject, &grpc_plugin_marker_type,
+                            &active_plugins_states);
+  rb_ivar_set(grpc_rb_cCallCredentials, rb_intern("__plugin_marker"),
+              plugin_marker);
+}
+
+/* Reset the active plugin states list after fork in the child process.
+ * After fork, the C core resets its own state, so the old plugin_destroy
+ * callbacks are never called. We must clear the inherited list to avoid
+ * marking stale proc references. The mutex does not need reinit because
+ * GRPC.prefork ensures all gRPC threads are stopped before fork, so it
+ * is guaranteed to be in an unlocked state. */
+void grpc_rb_call_credentials_postfork_child() {
+  plugin_ref* ref = active_plugins_states;
+  active_plugins_states = NULL;
+  while (ref) {
+    plugin_ref* next = ref->next;
+    gpr_free(ref);
+    ref = next;
+  }
 }
 
 /* Gets the wrapped grpc_call_credentials from the ruby wrapper */

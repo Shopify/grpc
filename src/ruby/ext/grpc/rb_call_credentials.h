@@ -29,4 +29,7 @@ void Init_grpc_call_credentials();
 
 grpc_call_credentials* grpc_rb_get_wrapped_call_credentials(VALUE v);
 
+/* Clears the active plugin states list after fork in the child process. */
+void grpc_rb_call_credentials_postfork_child();
+
 #endif /* GRPC_RB_CALL_CREDENTIALS_H_ */
