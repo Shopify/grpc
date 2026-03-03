@@ -407,9 +407,8 @@ void Init_grpc_call_credentials() {
    * plugin procs alive for as long as their C-level plugins exist.
    * Stored as an ivar on the class (a GC root via the constant table)
    * so the marker stays alive without rb_gc_register_address. */
-  VALUE plugin_marker =
-      TypedData_Wrap_Struct(rb_cObject, &grpc_plugin_marker_type,
-                            &active_plugins_states);
+  VALUE plugin_marker = TypedData_Wrap_Struct(
+      rb_cObject, &grpc_plugin_marker_type, &active_plugins_states);
   rb_ivar_set(grpc_rb_cCallCredentials, rb_intern("__plugin_marker"),
               plugin_marker);
 }
