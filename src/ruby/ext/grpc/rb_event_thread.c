@@ -42,7 +42,7 @@ typedef struct grpc_rb_event {
 typedef struct grpc_rb_event_queue {
   grpc_rb_event* head;
   grpc_rb_event* tail;
-  VALUE last_dequeued_proc; // We also mark this
+  VALUE last_dequeued_proc;  // We also mark this
 
   gpr_mu mu;
   gpr_cv cv;
@@ -193,8 +193,7 @@ static void* grpc_rb_wait_for_event_no_gil(void* param) {
       gpr_mu_unlock(&queue->mu);
       return event;
     }
-    gpr_cv_wait(&queue->cv, &queue->mu,
-                gpr_inf_future(GPR_CLOCK_REALTIME));
+    gpr_cv_wait(&queue->cv, &queue->mu, gpr_inf_future(GPR_CLOCK_REALTIME));
   }
   gpr_mu_unlock(&queue->mu);
   return NULL;
@@ -240,8 +239,8 @@ static VALUE grpc_rb_event_thread(void* arg) {
 }
 
 void Init_grpc_event_queue() {
-  grpc_rb_cEventQueue = rb_define_class_under(grpc_rb_mGrpcCore, "EventQueue",
-                                             rb_cObject);
+  grpc_rb_cEventQueue =
+      rb_define_class_under(grpc_rb_mGrpcCore, "EventQueue", rb_cObject);
   rb_define_alloc_func(grpc_rb_cEventQueue, grpc_rb_event_queue_alloc);
 }
 
@@ -278,8 +277,8 @@ void grpc_rb_event_queue_thread_stop() {
   TypedData_Get_Struct(g_event_queue, grpc_rb_event_queue,
                        &grpc_rb_event_queue_data_type, queue);
 
-  rb_thread_call_without_gvl(grpc_rb_event_unblocking_func_wrapper, queue,
-                             NULL, NULL);
+  rb_thread_call_without_gvl(grpc_rb_event_unblocking_func_wrapper, queue, NULL,
+                             NULL);
   rb_funcall(g_event_thread, rb_intern("join"), 0);
   g_event_thread = Qnil;
   g_event_queue = Qnil;
