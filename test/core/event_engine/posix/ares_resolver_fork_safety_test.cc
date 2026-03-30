@@ -95,8 +95,7 @@ TEST_F(AresResolverTest, ResetThenOrphanDoesNotCrash) {
 //
 // This is a more realistic scenario: the resolver has active DNS queries
 // when the fork handler fires and tears things down.
-TEST_F(AresResolverTest,
-       ResetThenOrphanWithPendingLookupsDoesNotCrash) {
+TEST_F(AresResolverTest, ResetThenOrphanWithPendingLookupsDoesNotCrash) {
   auto dns_server = DnsServer::Start(grpc_pick_unused_port_or_die());
   ASSERT_TRUE(dns_server.ok()) << dns_server.status();
 
@@ -104,8 +103,8 @@ TEST_F(AresResolverTest,
   auto* poller = GetPoller(ee.get());
 
   auto ares_resolver = AresResolver::CreateAresResolver(
-      dns_server->address(),
-      std::make_unique<GrpcPolledFdFactoryPosix>(poller), ee);
+      dns_server->address(), std::make_unique<GrpcPolledFdFactoryPosix>(poller),
+      ee);
   ASSERT_TRUE(ares_resolver.ok()) << ares_resolver.status();
 
   auto reinit_handle = ares_resolver->get()->GetReinitHandle().lock();
@@ -131,9 +130,7 @@ TEST_F(AresResolverTest,
 
 #else  // GRPC_ENABLE_FORK_SUPPORT
 
-TEST(AresResolverTest, Skipped) {
-  GTEST_SKIP() << "Fork support is disabled";
-}
+TEST(AresResolverTest, Skipped) { GTEST_SKIP() << "Fork support is disabled"; }
 
 #endif  // GRPC_ENABLE_FORK_SUPPORT
 
