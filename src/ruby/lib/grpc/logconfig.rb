@@ -52,6 +52,41 @@ module GRPC
     LOGGER = NoopLogger.new
   end
 
+  # Internal logging helpers.
+  #
+  # Building a log message often costs more than the work being described:
+  # interpolating a request body on every message, or asking for the time on
+  # every call. gRPC logs nothing at all by default, so that work is usually
+  # thrown away. These build the message only when a logger will take it.
+  #
+  # The message is handed over positionally and never as a block. GRPC.logger
+  # accepts any object a user supplies, and plenty of them define debug(msg)
+  # with a required argument; calling such a logger with a block and no
+  # argument raises ArgumentError.
+  def self.log_debug
+    log = logger
+    return nil if log.is_a?(DefaultLogger::NoopLogger)
+    return nil if log.respond_to?(:debug?) && !log.debug?
+    log.debug(yield)
+    nil
+  end
+
+  def self.log_info
+    log = logger
+    return nil if log.is_a?(DefaultLogger::NoopLogger)
+    return nil if log.respond_to?(:info?) && !log.info?
+    log.info(yield)
+    nil
+  end
+
+  def self.log_warn
+    log = logger
+    return nil if log.is_a?(DefaultLogger::NoopLogger)
+    return nil if log.respond_to?(:warn?) && !log.warn?
+    log.warn(yield)
+    nil
+  end
+
   # Inject the noop #logger if no module-level logger method has been injected.
   extend DefaultLogger unless methods.include?(:logger)
 end

@@ -89,12 +89,16 @@ results['server_stream'] = percentiles(samples).merge(
   messages_per_s: ((STREAM_ITERS * STREAM_MESSAGES) / (samples.sum / 1000.0)).round,
   mib_per_s: mib_per_s(STREAM_ITERS * stream_bytes, samples))
 
-# Client streaming: the client sends STREAM_MESSAGES messages.
+# Client streaming: the client sends STREAM_MESSAGES messages. The handler
+# returns how many it read, and that is checked: a send path that reported
+# throughput for messages the peer never saw would be measuring nothing.
 samples = measure(STREAM_ITERS) do
-  stub.client_stream(
+  reply = stub.client_stream(
     Enumerator.new do |yielder|
       STREAM_MESSAGES.times { yielder << Blob.new(STREAM_MESSAGE) }
     end)
+  got = reply.bytes.to_i
+  fail "short stream: #{got}" unless got == STREAM_MESSAGES
 end
 results['client_stream'] = percentiles(samples).merge(
   messages_per_s: ((STREAM_ITERS * STREAM_MESSAGES) / (samples.sum / 1000.0)).round,

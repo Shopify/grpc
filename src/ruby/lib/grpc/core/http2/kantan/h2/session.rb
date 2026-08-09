@@ -42,6 +42,191 @@ module Kantan
 
       CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".b.freeze
 
+      # grpc: reads frames through one reusable buffer.
+      #
+      # The frame loop used to call io.read(9) for every header and io.read(n)
+      # for every payload, so each frame cost at least two Strings and an
+      # unpack Array. This refills a single 64 KiB buffer with
+      # IO#readpartial(size, buf), which writes into the String already
+      # allocated here, and then reads integers straight out of it with
+      # getbyte and unpack1(offset:). Only payloads that outlive the buffer,
+      # such as a DATA chunk or a header block, are copied out.
+      class FrameReader
+        CHUNK = 65_536
+        EMPTY = ""
+
+        attr_reader :length, :type, :flags, :stream_id
+
+        def initialize io
+          @io = io
+          @buf = String.new(encoding: Encoding::BINARY, capacity: CHUNK)
+          @scratch = String.new(encoding: Encoding::BINARY, capacity: CHUNK)
+          @pos = 0
+          @length = @type = @flags = @stream_id = 0
+        end
+
+        # Decodes the next 9 byte frame header into the readers above.
+        # Returns false at a clean end of stream.
+        def next_frame
+          return false unless fill(9)
+          buf = @buf
+          pos = @pos
+          @length = (buf.getbyte(pos) << 16) |
+                    (buf.getbyte(pos + 1) << 8) |
+                    buf.getbyte(pos + 2)
+          @type = buf.getbyte(pos + 3)
+          @flags = buf.getbyte(pos + 4)
+          @stream_id = buf.unpack1("N", offset: pos + 5) & 0x7FFF_FFFF
+          @pos = pos + 9
+          true
+        end
+
+        # Copies +count+ bytes out. Used only where the bytes outlive the
+        # buffer.
+        def read count
+          return +"".b if count.zero?
+          return nil unless fill(count)
+          out = @buf.byteslice(@pos, count)
+          @pos += count
+          out
+        end
+
+        def readbyte
+          raise EOFError unless fill(1)
+          byte = @buf.getbyte(@pos)
+          @pos += 1
+          byte
+        end
+
+        # Big-endian integers, read in place.
+        def read_uint32
+          raise EOFError unless fill(4)
+          value = @buf.unpack1("N", offset: @pos)
+          @pos += 4
+          value
+        end
+
+        def read_uint64
+          raise EOFError unless fill(8)
+          value = @buf.unpack1("Q>", offset: @pos)
+          @pos += 8
+          value
+        end
+
+        # Reads a run of 6 byte SETTINGS entries without copying them.
+        def each_setting count
+          count.times do
+            raise EOFError unless fill(6)
+            pos = @pos
+            @pos += 6
+            yield @buf.unpack1("n", offset: pos),
+                  @buf.unpack1("N", offset: pos + 2)
+          end
+        end
+
+        # Drops +count+ bytes.
+        def skip count
+          while count.positive?
+            available = @buf.bytesize - @pos
+            if available >= count
+              @pos += count
+              return true
+            end
+            count -= available
+            @pos = @buf.bytesize
+            return false unless refill
+          end
+          true
+        end
+
+        private
+
+        # Makes at least +need+ bytes available, or returns false at EOF.
+        def fill need
+          while @buf.bytesize - @pos < need
+            return false unless refill
+          end
+          true
+        end
+
+        def refill
+          if @pos == @buf.bytesize
+            # Nothing is pending, so the buffer's storage can be reused whole.
+            # It is emptied first because the invariant this relies on is that
+            # a failed refill leaves nothing readable: otherwise the bytes just
+            # consumed stay visible and the next caller parses them again as a
+            # frame. IO#readpartial also empties the buffer before it raises,
+            # so this is belt and braces, but it keeps the guarantee local
+            # rather than borrowed. #clear keeps the capacity.
+            @buf.clear
+            @pos = 0
+            @io.readpartial(CHUNK, @buf)
+          else
+            # A frame straddles the end of the buffer. Drop what was already
+            # consumed, then append, so the buffer cannot grow without bound.
+            if @pos.positive?
+              @buf[0, @pos] = EMPTY
+              @pos = 0
+            end
+            @buf << @io.readpartial(CHUNK, @scratch)
+          end
+          true
+        rescue EOFError
+          false
+        end
+      end
+
+      # grpc: how many received bytes may go unacknowledged before a
+      # WINDOW_UPDATE is due. Half the window, so the peer always has room
+      # left when the acknowledgement goes out.
+      RECEIVE_WINDOW = Frames::Settings::ADVERTISED_INITIAL_WINDOW_SIZE
+      WINDOW_UPDATE_THRESHOLD = RECEIVE_WINDOW / 2
+
+      # grpc: SETTINGS carries the per-stream window, but the connection window
+      # can only be raised with a WINDOW_UPDATE on stream 0. Without this the
+      # connection stays at the 65535 byte default and throttles every stream
+      # on it, whatever they were promised individually.
+      CONNECTION_WINDOW_BUMP = [
+        (4 << 8) | 0x8, 0, 0, RECEIVE_WINDOW - 65_535
+      ].pack("NCNN").freeze
+
+      # grpc: writes the 9 byte frame header without the Array that
+      # [len_type, flags, id].pack("NCN", buffer: buf) allocates for every
+      # frame. Appending the bytes measured about 1.8 times faster.
+      def write_frame_header buf, length, type, flags, stream_id
+        buf << (length >> 16) << ((length >> 8) & 0xFF) << (length & 0xFF) <<
+               type << flags <<
+               (stream_id >> 24) << ((stream_id >> 16) & 0xFF) <<
+               ((stream_id >> 8) & 0xFF) << (stream_id & 0xFF)
+      end
+
+      # grpc: returns +len+ bytes of connection level window without touching a
+      # stream. DATA that this endpoint discards -- because the stream was
+      # reset locally, or had already closed -- has still spent the peer's
+      # connection window. Never returning it leaks the window for good, and a
+      # peer that cancels calls often would eventually stall every other
+      # stream on the connection.
+      def credit_connection_window len
+        return unless len.positive?
+        @connection_unacked += len
+        return if @connection_unacked < WINDOW_UPDATE_THRESHOLD
+        @write_queue << [:send_window_update, 0, @connection_unacked, 0]
+        @connection_unacked = 0
+      end
+
+      # grpc: appends a big-endian 32 bit value.
+      def write_uint32 buf, value
+        buf << (value >> 24) << ((value >> 16) & 0xFF) <<
+               ((value >> 8) & 0xFF) << (value & 0xFF)
+      end
+
+      # grpc: GOAWAY carries the last stream id and an error code.
+      def write_goaway_frame buf, error_code
+        write_frame_header buf, 8, 0x7, 0, 0
+        write_uint32 buf, @highest_stream_id
+        write_uint32 buf, error_code
+      end
+
       # grpc: max_concurrent_streams is configurable so that a gRPC server can
       # honour grpc.max_concurrent_streams from its channel args.
       def initialize io, handler:, max_concurrent_streams: 100
@@ -66,12 +251,17 @@ module Kantan
         )
 
         @connection_window = 65535
+        # grpc: received bytes not yet returned to the peer, connection wide.
+        @connection_unacked = 0
         @write_queue = Thread::Queue.new
         @next_stream_id = 1
         @streams = {}
         @highest_stream_id = 0 # Track highest stream ID seen from peer
         @open_stream_count = 0 # Track concurrent open streams
         @pending_body_size = 0
+        # grpc: streams with something queued to write, by id. flush_pending
+        # walks this instead of every live stream.
+        @active_bodies = {}
         @local_max_concurrent_streams = max_concurrent_streams
         # grpc: streams we reset locally. Frames the peer had already put on
         # the wire for them are discarded instead of failing the connection.
@@ -87,10 +277,17 @@ module Kantan
         @server_mode = nil
       end
 
+      # grpc: one place that knows the Stream layout, and the only place that
+      # seeds the unacknowledged byte counter.
+      def build_stream stream_id
+        Stream.new(stream_id, nil, 0, self, :idle,
+                   @peer_settings.initial_window_size, false, nil, false, nil, 0)
+      end
+
       def new_stream
         stream_id = @next_stream_id
         @next_stream_id += 2
-        stream = Stream.new(stream_id, nil, 0, self, :idle, @peer_settings.initial_window_size, false, nil, false)
+        stream = build_stream(stream_id)
         @streams[stream_id] = stream
         stream_id
       end
@@ -109,10 +306,14 @@ module Kantan
       end
 
       # grpc: appends one DATA chunk without necessarily ending the stream.
-      # +ack+ is invoked from the write thread once the chunk has been handed
-      # to the socket, which lets a caller apply flow-control backpressure.
+      # +ack+ is invoked from the write thread once the chunk has left the
+      # queue for the transport's write buffer, which lets a caller apply
+      # flow-control backpressure.
+      #
+      # +data+ becomes the transport's to write after this returns, so the
+      # caller must not keep hold of it. RpcStream#send_message copies for
+      # exactly that reason.
       def send_data stream_id, data, end_stream: false, ack: nil
-        data = data.b if data.encoding != Encoding::BINARY
         @write_queue << [:grpc_data, stream_id, data, end_stream, ack]
       end
 
@@ -155,6 +356,7 @@ module Kantan
         @server_mode = false
         @io.write CONNECTION_PREFACE
         @io.write Frames::Settings::DEFAULT_ENCODED
+        @io.write CONNECTION_WINDOW_BUMP
         start_write_thread
         start_read_thread
       end
@@ -170,6 +372,7 @@ module Kantan
           end
         end
         @io.write Frames::Settings::DEFAULT_ENCODED
+        @io.write CONNECTION_WINDOW_BUMP
         start_write_thread
         start_read_thread
       end
@@ -250,7 +453,22 @@ module Kantan
       def write_loop io
         wbuf = String.new(encoding: Encoding::BINARY, capacity: WRITE_BUFFER_SIZE)
 
-        while (cmd = @write_queue.pop)
+        while true
+          # grpc: flush before blocking on the queue, not only after handling a
+          # command. Several branches below skip the rest of the iteration with
+          # +next+ when their stream has gone, which used to jump straight past
+          # the flush at the bottom and leave a finished frame -- a PING ACK,
+          # say -- sitting in the buffer while this thread waited for work that
+          # never came. The peer then saw an open connection that had stopped
+          # answering.
+          if wbuf.bytesize.positive? && @write_queue.empty?
+            io.write wbuf
+            wbuf.clear
+          end
+
+          cmd = @write_queue.pop
+          break unless cmd
+
           case cmd[0]
           when :headers
             _, stream_id, headers, end_stream = cmd
@@ -258,12 +476,10 @@ module Kantan
             next unless stream
 
             hpack = @encoding_table.encode headers
-            len = hpack.bytesize
-            len_type = (len << 8) | 0x1
             flags = 0x04 # END_HEADERS
             flags |= 0x01 if end_stream
 
-            [len_type, flags, stream_id].pack("NCN", buffer: wbuf)
+            write_frame_header wbuf, hpack.bytesize, 0x1, flags, stream_id
             wbuf << hpack
 
             if stream.idle?
@@ -286,7 +502,7 @@ module Kantan
 
             # grpc: bodies are queued so that several writes can be in flight,
             # and the stream only half-closes once the queue is marked ended.
-            body = (stream.body ||= Body::Queue.new)
+            body = body_for(stream)
             body.push_data data
             body.end!
             @pending_body_size += data.bytesize
@@ -298,7 +514,7 @@ module Kantan
             next unless stream
 
             part = Body::File.new(path)
-            body = (stream.body ||= Body::Queue.new)
+            body = body_for(stream)
             body.push_part part
             body.end!
             @pending_body_size += part.bytesize
@@ -312,10 +528,10 @@ module Kantan
               next
             end
 
-            body = (stream.body ||= Body::Queue.new)
+            body = body_for(stream)
             body.push_data data, ack
-            body.end! if end_stream
             @pending_body_size += data.bytesize
+            body.end! if end_stream
             flush_pending wbuf
 
           when :grpc_trailers
@@ -323,7 +539,7 @@ module Kantan
             stream = @streams[stream_id]
             next unless stream
 
-            body = (stream.body ||= Body::Queue.new)
+            body = body_for(stream)
             body.end! headers
             flush_pending wbuf
 
@@ -332,8 +548,10 @@ module Kantan
             stream = @streams.delete(stream_id)
             next unless stream
 
-            [(4 << 8) | 0x3, 0, stream_id, error_code].pack("NCNN", buffer: wbuf)
+            write_frame_header wbuf, 4, 0x3, 0, stream_id
+            write_uint32 wbuf, error_code
             @locally_reset[stream_id] = true
+            @active_bodies.delete(stream_id)
             if stream.body
               @pending_body_size -= stream.body.bytesize
               stream.body.close
@@ -357,11 +575,12 @@ module Kantan
 
           when :rst_stream
             _, stream_id, error_code = cmd
-            [(4 << 8) | 0x3, 0, stream_id, error_code].pack("NCNN", buffer: wbuf)
+            write_frame_header wbuf, 4, 0x3, 0, stream_id
+            write_uint32 wbuf, error_code
 
           when :goaway
             _, error_code = cmd
-            [(8 << 8) | 0x7, 0, 0, @highest_stream_id, error_code].pack("NCNNN", buffer: wbuf)
+            write_goaway_frame wbuf, error_code
 
           when :window_update
             _, stream_id, increment = cmd
@@ -369,7 +588,7 @@ module Kantan
             if stream_id.zero?
               @connection_window += increment
               if @connection_window > 0x7FFF_FFFF
-                [(8 << 8) | 0x7, 0, 0, @highest_stream_id, 0x3].pack("NCNNN", buffer: wbuf)
+                write_goaway_frame wbuf, 0x3
                 break
               end
             else
@@ -377,7 +596,8 @@ module Kantan
               if stream
                 stream.window_size += increment
                 if stream.window_size > 0x7FFF_FFFF
-                  [(4 << 8) | 0x3, 0, stream_id, 0x3].pack("NCNN", buffer: wbuf)
+                  write_frame_header wbuf, 4, 0x3, 0, stream_id
+                  write_uint32 wbuf, 0x3
                   stream_overflow = true
                 end
               end
@@ -400,7 +620,7 @@ module Kantan
                 next if stream.idle? || stream.closed?
                 stream.window_size += delta
                 if stream.window_size > 0x7FFF_FFFF
-                  [(8 << 8) | 0x7, 0, 0, @highest_stream_id, 0x3].pack("NCNNN", buffer: wbuf)
+                  write_goaway_frame wbuf, 0x3
                   overflow = true
                   break
                 end
@@ -410,14 +630,21 @@ module Kantan
             flush_pending wbuf
 
           when :send_window_update
-            _, stream_id, increment = cmd
-            # Connection-level WINDOW_UPDATE (stream 0)
-            [(4 << 8) | 0x8, 0, 0, increment].pack("NCNN", buffer: wbuf)
-            # Stream-level WINDOW_UPDATE
-            [(4 << 8) | 0x8, 0, stream_id, increment].pack("NCNN", buffer: wbuf)
+            _, stream_id, connection_increment, stream_increment = cmd
+            # grpc: the two windows are returned in one command, and each is
+            # only written when it actually owes the peer something.
+            if connection_increment.positive?
+              write_frame_header wbuf, 4, 0x8, 0, 0
+              write_uint32 wbuf, connection_increment
+            end
+            if stream_increment.positive?
+              write_frame_header wbuf, 4, 0x8, 0, stream_id
+              write_uint32 wbuf, stream_increment
+            end
 
           when :close_stream
             _, stream = cmd
+            @active_bodies.delete(stream.id)
             if stream.body
               @pending_body_size -= stream.body.bytesize
               stream.body.close
@@ -428,8 +655,9 @@ module Kantan
             break
           end
 
-          # Flush when queue is drained (about to block) or buffer is large
-          if wbuf.bytesize > 0 && (@write_queue.empty? || wbuf.bytesize >= WRITE_BUFFER_SIZE)
+          # Flush a large buffer straight away; the drained case is handled at
+          # the top of the loop, where +next+ cannot skip it.
+          if wbuf.bytesize >= WRITE_BUFFER_SIZE
             io.write wbuf
             wbuf.clear
           end
@@ -454,65 +682,96 @@ module Kantan
         nil
       end
 
+      # grpc: returns the stream's body queue, creating it on first use, and
+      # records the stream as having work for flush_pending.
+      def body_for stream
+        @active_bodies[stream.id] = stream
+        stream.body ||= Body::Queue.new
+      end
+
       # grpc: rewritten so that a body queue can stay open across writes and so
       # that the stream can be terminated either by END_STREAM on the last DATA
       # frame or by a trailing HEADERS block.
+      #
+      # Only streams that actually have something queued are visited. Walking
+      # @streams.values built an Array of every live stream on the connection
+      # for each flush, which made writing one message cost time proportional
+      # to the number of open streams.
       def flush_pending wbuf
-        @streams.values.each do |stream|
-          body = stream.body
-          next unless body
-          next if body.terminated?
+        return if @active_bodies.empty?
+        @active_bodies.delete_if { |_id, stream| flush_stream wbuf, stream }
+      end
 
-          while (body = stream.body) && !body.terminated?
-            if body.empty?
-              break unless body.ended?
-              write_body_terminator wbuf, stream, body
-              break
-            end
-
-            max_frame = @peer_settings.max_frame_size
-            send_size = [body.bytesize, max_frame, stream.window_size,
-                         @connection_window].min
-
-            if send_size <= 0
-              if @pending_body_size > MAX_PENDING_BODY_SIZE
-                [(4 << 8) | 0x3, 0, stream.id, 0x7].pack("NCNN", buffer: wbuf)
-                @pending_body_size -= body.bytesize
-                body.close
-                body.terminate!
-                stream.body = nil
-                stream.close!
-                @streams.delete(stream.id)
-                @open_stream_count -= 1
-              end
-              break
-            end
-
-            chunk = body.read(send_size)
-            is_last = body.empty? && body.ended? && body.trailers.nil?
-
-            [(chunk.bytesize << 8) | 0x0, is_last ? 0x01 : 0x00,
-             stream.id].pack("NCN", buffer: wbuf)
-            wbuf << chunk
-
-            stream.window_size -= send_size
-            @connection_window -= send_size
-            @pending_body_size -= send_size
-
-            close_local_stream stream, body if is_last
+      # Writes what it can of one stream's queued body. Returns true once the
+      # stream has nothing left to write, so the caller can stop tracking it.
+      def flush_stream wbuf, stream
+        while (body = stream.body) && !body.terminated?
+          if body.empty?
+            break unless body.ended?
+            write_body_terminator wbuf, stream, body
+            break
           end
+
+          max_frame = @peer_settings.max_frame_size
+          send_size = [body.bytesize, max_frame, stream.window_size,
+                       @connection_window].min
+
+          if send_size <= 0
+            if @pending_body_size > MAX_PENDING_BODY_SIZE
+              write_frame_header wbuf, 4, 0x3, 0, stream.id
+              write_uint32 wbuf, 0x7
+              @pending_body_size -= body.bytesize
+              body.close
+              body.terminate!
+              stream.body = nil
+              stream.close!
+              @streams.delete(stream.id)
+              @open_stream_count -= 1
+            end
+            break
+          end
+
+          # grpc: send_size is already clamped to the queued bytes, so the
+          # frame is exactly that long. Writing the header first and letting
+          # the body append into the same buffer avoids allocating the chunk
+          # and copying it twice.
+          write_frame_header wbuf, send_size, 0x0, 0x00, stream.id
+          header_end = wbuf.bytesize
+          written = body.read_into wbuf, send_size
+
+          # send_size is clamped to the queued bytes, so this normally matches.
+          # A File part can still come up short if the file shrank, and a frame
+          # header that overstated its payload would desynchronise the peer.
+          if written != send_size
+            wbuf.setbyte(header_end - 9, written >> 16)
+            wbuf.setbyte(header_end - 8, (written >> 8) & 0xFF)
+            wbuf.setbyte(header_end - 7, written & 0xFF)
+          end
+
+          is_last = body.empty? && body.ended? && body.trailers.nil?
+          # END_STREAM is only known after the read, and the flags byte sits
+          # five bytes back from the end of the header.
+          wbuf.setbyte(header_end - 5, 0x01) if is_last
+
+          stream.window_size -= written
+          @connection_window -= written
+          @pending_body_size -= written
+
+          close_local_stream stream, body if is_last
         end
+
+        body = stream.body
+        body.nil? || body.terminated?
       end
 
       # grpc: emits the frame that carries END_STREAM once the queue drained.
       def write_body_terminator wbuf, stream, body
         if (trailers = body.trailers)
           hpack = @encoding_table.encode trailers
-          [(hpack.bytesize << 8) | 0x1, 0x04 | 0x01,
-           stream.id].pack("NCN", buffer: wbuf)
+          write_frame_header wbuf, hpack.bytesize, 0x1, 0x04 | 0x01, stream.id
           wbuf << hpack
         else
-          [0x0, 0x01, stream.id].pack("NCN", buffer: wbuf)
+          write_frame_header wbuf, 0, 0x0, 0x01, stream.id
         end
         close_local_stream stream, body
       end
@@ -532,25 +791,30 @@ module Kantan
       def start_read_thread
         @reader = Thread.new {
           Thread.current.name = "reader - " + @name
-          read_loop(@io)
+          read_loop(FrameReader.new(@io))
         }
       end
 
+      # grpc: +io+ is a FrameReader, which decodes each frame header in place
+      # instead of allocating a String and an unpack Array per frame.
       def read_loop io
         while true
           begin
-            str = io.read(9)
+            break unless io.next_frame
           rescue IOError, EOFError, SystemCallError, OpenSSL::OpenSSLError
             break
           end
-          break unless str
-          len_type, flags, stream_ident = str.unpack("NCN")
-          len = len_type >> 8
-          type = len_type & 0xFF
-          stream_ident &= 0x7FFF_FFFF # clear reserved bit
+          len = io.length
+          type = io.type
+          flags = io.flags
+          stream_ident = io.stream_id
 
           begin
-            if len > 16384 && type != 0x4 # SETTINGS_MAX_FRAME_SIZE default
+            # grpc: the limit is the frame size this endpoint accepts, and it
+            # applies to every frame type. SETTINGS used to be exempt, which
+            # let a peer hand the read thread an arbitrarily long frame to
+            # parse; RFC 7540 4.2 gives it no such exemption.
+            if len > Frames::Settings::MAX_INBOUND_FRAME_SIZE
               raise Errors::FrameSizeError.new("Frame too large", 0)
             end
 
@@ -573,14 +837,19 @@ module Kantan
             when 0x8 then handle_window_update io, len, flags, stream_ident
             when 0x9 then handle_continuation io, len, flags, stream_ident
             else
-              io.read(len) if len > 0 # skip unknown frame types (RFC 7540 4.1)
+              io.skip(len) if len > 0 # skip unknown frame types (RFC 7540 4.1)
             end
           rescue Errors::StreamError => e
-            io.read(e.remaining) if e.remaining > 0
+            io.skip(e.remaining) if e.remaining > 0
+            # grpc: the stream is being reset, but a DATA frame thrown away
+            # here has still spent connection window. Only DATA is flow
+            # controlled, so crediting any other frame type would inflate the
+            # window instead of restoring it.
+            credit_connection_window(e.remaining) if type == 0x0
             @write_queue << [:rst_stream, e.stream_id, e.error_code]
             @highest_stream_id = e.stream_id if e.stream_id > @highest_stream_id
           rescue Errors::ConnectionError => e
-            io.read(e.remaining) if e.remaining > 0
+            io.skip(e.remaining) if e.remaining > 0
             @write_queue << [:goaway, e.error_code]
             @write_queue << [:shutdown]
             break
@@ -610,7 +879,10 @@ module Kantan
         # grpc: a stream we reset locally may still have frames in flight;
         # discard them rather than failing the whole connection.
         if @locally_reset[stream_id]
-          io.read(len) if len > 0
+          io.skip(len) if len > 0
+          # The peer spent connection window on this frame even though it is
+          # thrown away, so the window has to be given back.
+          credit_connection_window len
           return
         end
 
@@ -657,11 +929,34 @@ module Kantan
           chunk = io.read(data_len)
           stream.data_received += data_len
           @handler.on_data stream, chunk
-          @write_queue << [:send_window_update, stream_id, data_len]
         end
 
         # Read and discard padding
-        io.read(pad_length) if pad_length > 0
+        io.skip(pad_length) if pad_length > 0
+
+        # grpc: return flow control window in blocks. Acknowledging every DATA
+        # frame cost a queue push, a writer wake and two WINDOW_UPDATE frames
+        # per frame received; the peer only needs the window back before it
+        # runs out, so this waits until half of it is spent.
+        #
+        # The debt is the whole frame payload, the Pad Length byte and the
+        # padding included, as RFC 7540 6.9.1 requires. Counting only the
+        # application bytes would strand the padding in the window for good,
+        # and a frame that carried nothing but padding would return nothing.
+        if len.positive?
+          @connection_unacked += len
+          stream.unacked += len
+          # A stream the peer has just ended does not need its window back.
+          ends_stream = flags.odd?
+          if @connection_unacked >= WINDOW_UPDATE_THRESHOLD ||
+             (!ends_stream && stream.unacked >= WINDOW_UPDATE_THRESHOLD)
+            @write_queue << [:send_window_update, stream_id,
+                             @connection_unacked,
+                             ends_stream ? 0 : stream.unacked]
+            @connection_unacked = 0
+            stream.unacked = 0
+          end
+        end
 
         # If END_STREAM flag is set, half-close remote
         if flags.odd? # Bottom bit is set
@@ -690,7 +985,7 @@ module Kantan
 
         # grpc: see handle_data; tolerate late frames for locally reset streams.
         if @locally_reset[stream_id]
-          io.read(len) if len > 0
+          io.skip(len) if len > 0
           return
         end
 
@@ -772,7 +1067,7 @@ module Kantan
             stream_dependency = payload.unpack1("N") & 0x7FFF_FFFF
             # Check for self-dependency
             if stream_dependency == stream_id
-              io.read(pad_length) if pad_length > 0
+              io.skip(pad_length) if pad_length > 0
               raise Errors::StreamError.new("HEADERS self-dependency", stream_id)
             end
             # Remove priority data from payload
@@ -781,7 +1076,7 @@ module Kantan
           end
 
           # Read and discard padding
-          io.read(pad_length) if pad_length > 0
+          io.skip(pad_length) if pad_length > 0
         end
 
         # Check if END_HEADERS flag is set (bit 2)
@@ -791,7 +1086,7 @@ module Kantan
             @highest_stream_id = stream_id
           end
 
-          stream = @streams[stream_id] ||= Stream.new(stream_id, nil, 0, self, :idle, @peer_settings.initial_window_size, false, nil, false)
+          stream = @streams[stream_id] ||= build_stream(stream_id)
 
           # Complete header block in this frame
           headers = @decoding_table.decode payload, payload_start, payload_len, max_list_size: MAX_HEADER_LIST_SIZE
@@ -852,13 +1147,13 @@ module Kantan
         raise Errors::ProtocolError.new("PING on non-zero stream", len) unless stream_ident.zero?
         raise Errors::FrameSizeError.new("PING length != 8", len) unless len == 8
 
-        payload = io.read(8)
         if flags.even?
-          # Peer PING: queue ACK for write thread
-          @write_queue << [:ping_ack, payload]
+          # Peer PING: queue ACK for write thread. This payload has to be
+          # echoed back, so it is the one PING body that must be copied.
+          @write_queue << [:ping_ack, io.read(8)]
         else
           # ACK of our PING: compute RTT
-          sent_at = payload.unpack1("Q>")
+          sent_at = io.read_uint64
           rtt_ns = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - sent_at
           @handler.on_ping rtt_ns
         end
@@ -875,13 +1170,10 @@ module Kantan
 
         raise Errors::FrameSizeError.new("SETTINGS length not multiple of 6", len) if (len % 6) != 0
 
-        payload = io.read(len)
         parsed = {}
         offset = 0
 
-        while offset < len
-          ident = payload.unpack1("n", offset: offset)
-          value = payload.unpack1("N", offset: offset + 2)
+        io.each_setting(len / 6) do |ident, value|
 
           # Validate parameter values
           case ident
@@ -915,18 +1207,16 @@ module Kantan
         raise Errors::FrameSizeError.new("GOAWAY too short", len) if len < 8
 
         # Consume last_stream_id and error_code fields to advance the IO position
-        io.read(8)
+        io.skip(8)
 
         # Read optional debug data
-        if len > 8
-          io.read(len - 8)
-        end
+        io.skip(len - 8) if len > 8
       end
 
       def handle_window_update io, len, flags, stream_ident
         raise Errors::FrameSizeError.new("WINDOW_UPDATE length != 4", len) unless len == 4
 
-        increment = io.read(4).unpack1("N") & 0x7FFF_FFFF
+        increment = io.read_uint32 & 0x7FFF_FFFF
 
         # Increment must be non-zero
         if increment.zero?
@@ -963,7 +1253,7 @@ module Kantan
         raise Errors::FrameSizeError.new("RST_STREAM length != 4", len) if len != 4
 
         # Consume error_code to advance the IO position
-        error_code = io.read(4).unpack1("N")
+        error_code = io.read_uint32
 
         # Validate stream state - RST_STREAM on idle stream is PROTOCOL_ERROR
         stream = @streams[stream_id]
@@ -1043,7 +1333,7 @@ module Kantan
           @continuation_stream_id = nil
           @continuation_flags = nil
 
-          stream = @streams[stream_id] ||= Stream.new(stream_id, nil, 0, self, :idle, @peer_settings.initial_window_size, false, nil, false)
+          stream = @streams[stream_id] ||= build_stream(stream_id)
 
           headers = @decoding_table.decode complete_payload, 0, complete_payload.bytesize, max_list_size: MAX_HEADER_LIST_SIZE
 

@@ -202,27 +202,51 @@ module Kantan
     # Build encoding lookup table: byte value -> [code, length]
     ENCODE_TABLE = Ractor.make_shareable(CODES[0, 256].map { |_sym, code, length| [code, length] })
 
+    # grpc: the same table split in two, so the encoder reads one Integer per
+    # lookup instead of unpacking a pair.
+    ENCODE_CODES = Ractor.make_shareable(ENCODE_TABLE.map(&:first))
+    ENCODE_LENGTHS = Ractor.make_shareable(ENCODE_TABLE.map(&:last))
+
+    # grpc: low-bit masks, indexed by bit count.
+    BIT_MASKS = Ractor.make_shareable([0x00, 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F])
+
+    # grpc: how many bytes #encode would produce, without producing them.
+    # HPACK only emits the Huffman form when it is shorter than the literal,
+    # so the caller can skip the encode entirely for values that do not
+    # compress. Measuring is about 2.4 times cheaper than encoding.
+    def self.encoded_bytesize str
+      lengths = ENCODE_LENGTHS
+      bits = 0
+      str.each_byte { |byte| bits += lengths[byte] }
+      (bits + 7) >> 3
+    end
+
     def self.encode str
-      out = ""
+      codes = ENCODE_CODES
+      lengths = ENCODE_LENGTHS
+      masks = BIT_MASKS
+      out = String.new(encoding: Encoding::BINARY, capacity: str.bytesize)
       bits = 0
       buf = 0
 
       str.each_byte do |byte|
-        code, length = ENCODE_TABLE[byte]
-        buf = (buf << length) | code
+        length = lengths[byte]
+        buf = (buf << length) | codes[byte]
         bits += length
 
         while bits >= 8
           bits -= 8
           out << ((buf >> bits) & 0xFF)
         end
+
+        # grpc: drop the bits already written. Without this +buf+ keeps every
+        # bit of the whole string, becomes a Bignum after about eight bytes,
+        # and every shift after that allocates.
+        buf &= masks[bits]
       end
 
       # Pad with EOS prefix (all 1s)
-      if bits > 0
-        buf = (buf << (8 - bits)) | ((1 << (8 - bits)) - 1)
-        out << (buf & 0xFF)
-      end
+      out << (((buf << (8 - bits)) | masks[8 - bits]) & 0xFF) if bits > 0
 
       out
     end

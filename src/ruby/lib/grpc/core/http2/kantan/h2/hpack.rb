@@ -36,12 +36,13 @@ module Kantan
         [value, pos]
       end
 
+      # grpc: appends bytes rather than one-byte Strings from Integer#chr.
       def write out, value
         while value >= 0x80
-          out << ((value & 0x7F) | 0x80).chr
+          out << ((value & 0x7F) | 0x80)
           value >>= 7
         end
-        out << value.chr
+        out << value
         out
       end
     end
@@ -390,34 +391,38 @@ module Kantan
         end
       end
 
+      # grpc: +out << byte+ appends one byte to a binary String, and unlike
+      # [byte].pack("C", buffer: out) it does not allocate the pair Array.
       def encode_integer out, value, prefix_bits, pattern
         max = (1 << prefix_bits) - 1
         if value < max
-          [pattern | value].pack("C", buffer: out)
+          out << (pattern | value)
         else
-          [pattern | max].pack("C", buffer: out)
+          out << (pattern | max)
           Varint.write(out, value - max)
         end
       end
 
       def encode_string out, str
-        huffed = Huffman.encode(str)
-        if huffed.bytesize < str.bytesize
-          len = huffed.bytesize
-          if len < 127
-            [0x80 | len].pack("C", buffer: out)
+        # grpc: measure the Huffman form before producing it. The literal wins
+        # often enough that encoding first and discarding the result was pure
+        # waste, and measuring costs about 40 per cent of an encode.
+        size = Huffman.encoded_bytesize(str)
+        if size < str.bytesize
+          if size < 127
+            out << (0x80 | size)
           else
-            [0xFF].pack("C", buffer: out)
-          Varint.write(out, len - 127)
+            out << 0xFF
+            Varint.write(out, size - 127)
           end
-          out << huffed
+          out << Huffman.encode(str)
         else
           len = str.bytesize
           if len < 127
-            [len].pack("C", buffer: out)
+            out << len
           else
-            [0x7F].pack("C", buffer: out)
-          Varint.write(out, len - 127)
+            out << 0x7F
+            Varint.write(out, len - 127)
           end
           out << str
         end

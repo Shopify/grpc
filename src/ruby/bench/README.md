@@ -55,18 +55,23 @@ it, because YJIT moves the two implementations by different amounts.
 
 Five runs of each setting on one arm64 macOS machine gave these ranges:
 
-| Pairing | Metric | No YJIT | YJIT |
-| --- | --- | --- | --- |
-| `self/self` | unary qps | 3210-3571 | 4455-4871 |
-| `self/baseline` | s-stream msg/s | 177976-193630 | 221614-253849 |
-| `baseline/self` | s-stream msg/s | 17302-18460 | 20160-22559 |
-| `baseline/baseline` | unary qps | 4693-6254 | 6096-7210 |
+| Pairing | Metric | No YJIT | YJIT | median |
+| --- | --- | --- | --- | --- |
+| `self/self` | unary qps | 4610-4866 | 7386-7620 | +58% |
+| `self/baseline` | s-stream msg/s | 208505-212565 | 313603-318949 | +50% |
+| `baseline/self` | s-stream msg/s | 53300-54277 | 53602-54397 | 0% |
+| `baseline/baseline` | unary qps | 6068-7770 | 6599-6771 | +6% |
 
-The pure Ruby ranges do not overlap, so YJIT clearly helps it, by 17 to
-34 percent depending on the path. The C extension ranges overlap, so this
-benchmark cannot separate its 3 to 5 percent median change from run to
-run variation. That is the expected shape: the C extension does its work
-outside the Ruby VM.
+YJIT is worth 50 to 58 per cent wherever pure Ruby is doing the work, and
+the ranges do not overlap. Two rows show nothing, for different reasons:
+
+- `baseline/baseline` is the C extension on both sides, which does its
+  work outside the Ruby VM. The ranges overlap, so this benchmark cannot
+  separate its median change from run to run variation.
+- `baseline/self` is pure Ruby receiving from a C sender, and it does not
+  move at all. That figure is set by how fast the C extension sends, not
+  by how fast this implementation can receive, so speeding up the Ruby
+  side does not show up in it.
 
 ## What it measures
 
@@ -98,19 +103,24 @@ Each streaming scenario has a sender and a receiver:
 | `client_stream` | the client column | the server column |
 
 To judge one implementation, read the two rows where it sits on the side
-you care about. For example, these numbers say that `self` sends about
-ten times faster than it receives:
+you care about. For example:
 
 ```
   server/client   s-stream m/s  c-stream m/s
-  self/baseline         187396         17598
-  baseline/self          18808        199261
+  self/baseline         310231         49935
+  baseline/self          54599        330655
 ```
 
 `self` is the sender in `self/baseline` server streaming and in
-`baseline/self` client streaming, and both are fast. `self` is the
-receiver in the other two cells, and both are slow. The receive path is
-therefore the bottleneck, in both directions.
+`baseline/self` client streaming, and reaches about 310000 and 330000
+messages a second. It is the receiver in the other two cells, at about
+50000 and 55000.
+
+Do not read that gap as the receive path being six times slower. Both of
+those cells have the C extension on the other side, and 50000 to 55000
+messages a second is close to what the C extension reaches sending to
+itself. These two cells measure the C peer, not this implementation. The
+`self/self` row is the one that shows what pure Ruby does at both ends.
 
 ## Tuning
 

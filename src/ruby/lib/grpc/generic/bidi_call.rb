@@ -145,7 +145,7 @@ module GRPC
       GRPC.logger.debug('bidi-write-loop: starting')
       count = 0
       requests.each do |req|
-        GRPC.logger.debug("bidi-write-loop: #{count}")
+        GRPC.log_debug { "bidi-write-loop: #{count}" }
         count += 1
         payload = @marshal.call(req)
         # Fails if status already received
@@ -160,9 +160,9 @@ module GRPC
           break
         end
       end
-      GRPC.logger.debug("bidi-write-loop: #{count} writes done")
+      GRPC.log_debug { "bidi-write-loop: #{count} writes done" }
       if is_client
-        GRPC.logger.debug("bidi-write-loop: client sent #{count}, waiting")
+        GRPC.log_debug { "bidi-write-loop: client sent #{count}, waiting" }
         begin
           @call.run_batch(SEND_CLOSE_FROM_CLIENT => nil)
         rescue GRPC::Core::CallError => e
@@ -197,19 +197,19 @@ module GRPC
         count = 0
         # queue the initial read before beginning the loop
         loop do
-          GRPC.logger.debug("bidi-read-loop: #{count}")
+          GRPC.log_debug { "bidi-read-loop: #{count}" }
           count += 1
           batch_result = read_using_run_batch
 
           # handle the next message
           if batch_result.nil? || batch_result.message.nil?
-            GRPC.logger.debug("bidi-read-loop: null batch #{batch_result}")
+            GRPC.log_debug { "bidi-read-loop: null batch #{batch_result}" }
 
             if is_client
               batch_result = @call.run_batch(RECV_STATUS_ON_CLIENT => nil)
               @call.status = batch_result.status
               @call.trailing_metadata = @call.status.metadata if @call.status
-              GRPC.logger.debug("bidi-read-loop: done status #{@call.status}")
+              GRPC.log_debug { "bidi-read-loop: done status #{@call.status}" }
               batch_result.check_status
             end
 

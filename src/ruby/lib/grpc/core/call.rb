@@ -506,7 +506,12 @@ module GRPC
           return with_debug(Struct::Status.new(failure.code, failure.details,
                                                {}, nil))
         end
-        if pairs.empty? && deadline_passed?
+        # A gRPC deadline is absolute. Trailers that reach us after it has
+        # passed do not rescue the call, and asking only whether any trailers
+        # turned up lets a status that lost the race report success for an RPC
+        # that had already timed out.
+        if @stream.unfinished_at?(@monotonic_deadline) ||
+           (pairs.empty? && deadline_passed?)
           return with_debug(Struct::Status.new(StatusCodes::DEADLINE_EXCEEDED,
                                                'Deadline Exceeded', {}, nil))
         end

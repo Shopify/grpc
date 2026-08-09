@@ -37,6 +37,12 @@ module GRPC
       # caller is made to wait.
       WRITE_HIGH_WATER = 256 * 1024
 
+      # How much consumed prefix may sit in the receive buffer before it is
+      # reclaimed. Only reached while a message is assembled from many frames.
+      COMPACT_THRESHOLD = 64 * 1024
+
+      EMPTY = ''.b.freeze
+
       # A transport failure translated into a gRPC status.
       Failure = Struct.new(:code, :details)
 
@@ -52,7 +58,12 @@ module GRPC
         @headers = nil
         @trailers = nil
         @buffer = +''.b
+        # Bytes of @buffer already handed to the reader. Consuming with a
+        # cursor keeps a read from copying the whole remainder.
+        @read_pos = 0
         @eos = false
+        # Monotonic instant the stream finished, however it finished.
+        @terminated_at = nil
         @failure = nil
         @local_closed = false
         @recv_encoding = 'identity'
@@ -74,6 +85,13 @@ module GRPC
 
       def push_data(chunk)
         @mu.synchronize do
+          # Drop the consumed prefix before it can dominate the buffer. A
+          # reader that keeps up clears it in #advance instead, so this only
+          # runs when a message is being assembled from many frames.
+          if @read_pos >= COMPACT_THRESHOLD
+            @buffer[0, @read_pos] = EMPTY
+            @read_pos = 0
+          end
           @buffer << chunk
           @cv.broadcast
         end
@@ -82,6 +100,7 @@ module GRPC
       def push_trailers(pairs)
         @mu.synchronize do
           @trailers = pairs
+          @terminated_at ||= RpcStream.now
           @cv.broadcast
         end
       end
@@ -90,6 +109,7 @@ module GRPC
         @mu.synchronize do
           @eos = true
           @trailers ||= @headers if @headers && trailers_only?(@headers)
+          @terminated_at ||= RpcStream.now
           @cv.broadcast
         end
       end
@@ -98,7 +118,20 @@ module GRPC
         @mu.synchronize do
           @failure ||= Failure.new(code, details)
           @eos = true
+          @terminated_at ||= RpcStream.now
           @cv.broadcast
+        end
+      end
+
+      # True when this stream had not finished by +deadline+, a monotonic
+      # instant. A gRPC deadline is absolute: a status that reaches the client
+      # after the deadline has already passed does not rescue the call, so the
+      # arrival time is what decides, not whether a status turned up before
+      # anybody got round to asking for it.
+      def unfinished_at?(deadline)
+        return false if deadline.nil?
+        @mu.synchronize do
+          @terminated_at.nil? || @terminated_at > deadline
         end
       end
 
@@ -133,17 +166,24 @@ module GRPC
 
       # Blocks for one complete gRPC message. Returns nil at end of stream.
       def read_message(deadline)
-        header = read_bytes(FRAME_HEADER_SIZE, deadline)
-        return nil if header.nil?
-        compressed = header.getbyte(0) == 1
-        length = header.byteslice(1, 4).unpack1('N')
+        compressed = false
+        length = 0
+        # The five byte prefix is read in place: slicing it out allocated a
+        # String and a second one for the length field, per message.
+        @mu.synchronize do
+          return nil unless await_bytes(FRAME_HEADER_SIZE, deadline)
+          compressed = @buffer.getbyte(@read_pos) == 1
+          length = @buffer.unpack1('N', offset: @read_pos + 1)
+          advance(FRAME_HEADER_SIZE)
+        end
         if @max_receive_message_length.positive? &&
            length > @max_receive_message_length
           fail ResourceExhausted,
                "Received message larger than max (#{length} vs. " \
                "#{@max_receive_message_length})"
         end
-        body = length.zero? ? +''.b : read_bytes(length, deadline)
+        return +''.b if length.zero?
+        body = read_bytes(length, deadline)
         fail Truncated, 'truncated gRPC message' if body.nil?
         compressed ? MessageCompression.decompress(@recv_encoding, body) : body
       end
@@ -161,15 +201,31 @@ module GRPC
       # message: waiting for each frame to reach the socket costs a thread
       # handoff per message and collapses streaming throughput, while an
       # unbounded queue would let a slow peer exhaust memory.
+      #
+      # The payload is copied into the frame, and that copy is not optional.
+      # This method returns while the frame is still queued, so anything kept
+      # by reference would still be the transport's to write after the caller
+      # got control back. A marshaller is free to hand out one reused buffer,
+      # and gRPC's C extension copies into a byte buffer for the same reason.
+      # Aliasing it here corrupted streamed messages, and because the length
+      # prefix is fixed at this moment while the bytes were not, a payload
+      # that changed size desynchronised the stream and killed the RPC.
       def send_message(payload, no_compress: false)
-        body = payload.b
         flag = 0
         if !no_compress && @send_encoding != 'identity'
-          body = MessageCompression.compress(@send_encoding, body)
+          payload = MessageCompression.compress(@send_encoding, payload)
           flag = 1
         end
-        frame = [flag, body.bytesize].pack('CN') << body
-        queue_write(frame)
+        size = payload.bytesize
+        frame = String.new(encoding: Encoding::BINARY,
+                           capacity: size + FRAME_HEADER_SIZE)
+        frame << flag <<
+          (size >> 24) << ((size >> 16) & 0xFF) <<
+          ((size >> 8) & 0xFF) << (size & 0xFF)
+        # Appends the bytes whatever the payload's encoding, and never leaves
+        # the buffer tagged as anything but binary.
+        Http2::Kantan::H2::Body.append_bytes(frame, payload)
+        queue_write(frame, frame.bytesize)
         nil
       end
 
@@ -199,9 +255,13 @@ module GRPC
       end
 
       # Hands +frame+ to the transport, blocking only once more than
-      # WRITE_HIGH_WATER bytes are queued but not yet on the socket.
-      def queue_write(frame)
-        size = frame.bytesize
+      # WRITE_HIGH_WATER bytes are queued but not yet written.
+      #
+      # +frame+ is a String, or an Array of segments to be written back to
+      # back. +size+ is their total. It has no default on purpose: an Array
+      # has no #bytesize, so a default would only work for one of the two
+      # shapes and fail late on the other.
+      def queue_write(frame, size)
         @write_mu.synchronize { @queued_bytes += size }
         ack = lambda do
           @write_mu.synchronize do
@@ -236,18 +296,36 @@ module GRPC
       # stream, and raises the stream failure if one arrived first.
       def read_bytes(count, deadline)
         @mu.synchronize do
-          wait_until(deadline) do
-            @buffer.bytesize >= count || @eos || @failure
-          end
-          if @buffer.bytesize < count
-            return nil if @buffer.empty?
-            fail Truncated, 'truncated gRPC message' if @eos
-            return nil
-          end
-          out = @buffer.byteslice(0, count)
-          @buffer = @buffer.byteslice(count..) || +''.b
+          return nil unless await_bytes(count, deadline)
+          out = @buffer.byteslice(@read_pos, count)
+          advance(count)
           out
         end
+      end
+
+      # Must be called with @mu held. True once +count+ bytes are buffered.
+      # False at a clean end of stream or an expired deadline; raises when the
+      # peer stopped part way through a message.
+      def await_bytes(count, deadline)
+        wait_until(deadline) { buffered >= count || @eos || @failure }
+        return true if buffered >= count
+        return false if buffered.zero?
+        fail Truncated, 'truncated gRPC message' if @eos
+        false
+      end
+
+      # Must be called with @mu held.
+      def buffered
+        @buffer.bytesize - @read_pos
+      end
+
+      # Must be called with @mu held. Marks +count+ bytes consumed, and hands
+      # the storage back once the reader has caught up with the writer.
+      def advance(count)
+        @read_pos += count
+        return if @read_pos < @buffer.bytesize
+        @buffer.clear
+        @read_pos = 0
       end
 
       # Must be called with @mu held.

@@ -24,7 +24,7 @@ class Struct
     def check_status
       return nil if status.nil?
       if status.code != GRPC::Core::StatusCodes::OK
-        GRPC.logger.debug("Failing with status #{status}")
+        GRPC.log_debug { "Failing with status #{status}" }
         # raise BadStatus, propagating the metadata if present.
         fail GRPC::BadStatus.new_status_exception(
           status.code, status.details, status.metadata,
@@ -198,7 +198,7 @@ module GRPC
     # marshalled.
     def remote_send(req, marshalled = false)
       send_initial_metadata
-      GRPC.logger.debug("sending #{req}, marshalled? #{marshalled}")
+      GRPC.log_debug { "sending #{req}, marshalled? #{marshalled}" }
       payload = marshalled ? req : @marshal.call(req)
       @call.run_batch(SEND_MESSAGE => payload)
     end
@@ -264,7 +264,7 @@ module GRPC
       end
       get_message_from_batch_result(batch_result)
     rescue GRPC::Core::CallError => e
-      GRPC.logger.info("remote_read: #{e}")
+      GRPC.log_info { "remote_read: #{e}" }
       nil
     ensure
       # Ensure we don't attempt to request the initial metadata again
@@ -561,7 +561,7 @@ module GRPC
     # Waits till an operation completes
     def wait
       return if @op_notifier.nil?
-      GRPC.logger.debug("active_call.wait: on #{@op_notifier}")
+      GRPC.log_debug { "active_call.wait: on #{@op_notifier}" }
       @op_notifier.wait
     end
 

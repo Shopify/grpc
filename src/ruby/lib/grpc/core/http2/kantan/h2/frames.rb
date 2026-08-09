@@ -42,11 +42,35 @@ module Kantan
 
         NAMES.each_with_index { next unless _1; const_set(_1, _2) }
 
+        # grpc: these are this endpoint's own policy. They are deliberately not
+        # called INITIAL_WINDOW_SIZE or MAX_FRAME_SIZE, because NAMES above
+        # already binds those to the setting identifiers 4 and 5.
+        #
+        # The HTTP/2 default window is 65535 bytes, so a peer sending
+        # 64 KiB messages has to stop and wait for a WINDOW_UPDATE on every
+        # one of them. gRPC moves messages of that size routinely, so this
+        # advertises a window big enough to keep them flowing. The connection
+        # window is raised to match in Session, and it is what bounds how much
+        # unread data a connection can hold.
+        ADVERTISED_INITIAL_WINDOW_SIZE = 1 << 20
+
+        # grpc: the largest frame this endpoint accepts. This is the protocol
+        # default, so it is not advertised; naming it keeps Session's inbound
+        # check and what a peer assumes about us in step.
+        #
+        # Raising it and advertising it was measured, and bought about 7 per
+        # cent on 64 KiB messages between two pure Ruby peers, and nothing at
+        # all against a C peer, which keeps sending 16 KiB frames. It also
+        # fails h2spec 4.2.3, which sizes its oversized HEADERS frame against
+        # the default rather than against the advertised value. Not worth it.
+        MAX_INBOUND_FRAME_SIZE = 16_384
+
         DEFAULT = self.new(
           nil,
           nil, # default is 4096
           nil, # don't specify push promise
           100, # max concurrent streams
+          ADVERTISED_INITIAL_WINDOW_SIZE,
         ).freeze
 
         def self.encode stream_id, settings

@@ -110,7 +110,7 @@ module GRPC
     # Forcibly shutdown any threads that are still alive.
     def forcibly_stop_workers
       return unless @workers.size > 0
-      GRPC.logger.info("forcibly terminating #{@workers.size} worker(s)")
+      GRPC.log_info { "forcibly terminating #{@workers.size} worker(s)" }
       @workers.each do |t|
         next unless t.alive?
         begin
@@ -433,7 +433,7 @@ module GRPC
     def implemented?(an_rpc)
       mth = an_rpc.method.to_sym
       return an_rpc if rpc_descs.key?(mth)
-      GRPC.logger.warn("UNIMPLEMENTED: #{an_rpc}")
+      GRPC.log_warn { "UNIMPLEMENTED: #{an_rpc}" }
       noop = proc { |x| x }
 
       # Create a new active call that knows that
@@ -471,7 +471,7 @@ module GRPC
           # these might happen for various reasons.  The correct behavior of
           # the server is to log them and continue, if it's not shutting down.
           if running_state == :running
-            GRPC.logger.warn("server call failed: #{e}")
+            GRPC.log_warn { "server call failed: #{e}" }
           end
           next
         end
@@ -479,7 +479,7 @@ module GRPC
       # @running_state should be :stopping here
       @run_mutex.synchronize do
         transition_running_state(:stopped)
-        GRPC.logger.info("stopped: #{self}")
+        GRPC.log_info { "stopped: #{self}" }
         @server.close
       end
     end
@@ -498,7 +498,7 @@ module GRPC
       return nil unless implemented?(an_rpc)
 
       # Create the ActiveCall. Indicate that metadata hasnt been sent yet.
-      GRPC.logger.info("deadline is #{an_rpc.deadline}; (now=#{Time.now})")
+      GRPC.log_info { "deadline is #{an_rpc.deadline}; (now=#{Time.now})" }
       rpc_desc = rpc_descs[an_rpc.method.to_sym]
       c = ActiveCall.new(an_rpc.call,
                          rpc_desc.marshal_proc,
@@ -544,7 +544,7 @@ module GRPC
         else
           handlers[route] = service.method(rpc_name)
         end
-        GRPC.logger.info("handling #{route} with #{handlers[route]}")
+        GRPC.log_info { "handling #{route} with #{handlers[route]}" }
       end
     end
   end

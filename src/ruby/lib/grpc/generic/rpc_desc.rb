@@ -130,16 +130,16 @@ module GRPC
     rescue BadStatus => e
       # this is raised by handlers that want GRPC to send an application error
       # code and detail message and some additional app-specific metadata.
-      GRPC.logger.debug("app err:#{active_call}, status:#{e.code}:#{e.details}")
+      GRPC.log_debug { "app err:#{active_call}, status:#{e.code}:#{e.details}" }
       send_status(active_call, e.code, e.details, e.metadata)
     rescue Core::CallError => e
       # This is raised by GRPC internals but should rarely, if ever happen.
       # Log it, but don't notify the other endpoint..
-      GRPC.logger.warn("failed call: #{active_call}\n#{e}")
+      GRPC.log_warn { "failed call: #{active_call}\n#{e}" }
     rescue Core::OutOfTime
       # This is raised when active_call#method.call exceeds the deadline
       # event.  Send a status of deadline exceeded
-      GRPC.logger.warn("late call: #{active_call}")
+      GRPC.log_warn { "late call: #{active_call}" }
       send_status(active_call, DEADLINE_EXCEEDED, 'late')
     rescue StandardError, NotImplementedError => e
       # This will usuaally be an unhandled error in the handling code.
@@ -148,7 +148,7 @@ module GRPC
       # Note: this intentionally does not map NotImplementedError to
       # UNIMPLEMENTED because NotImplementedError is intended for low-level
       # OS interaction (e.g. syscalls) not supported by the current OS.
-      GRPC.logger.warn("failed handler: #{active_call}; sending status:UNKNOWN")
+      GRPC.log_warn { "failed handler: #{active_call}; sending status:UNKNOWN" }
       GRPC.logger.warn(e)
       send_status(active_call, UNKNOWN, "#{e.class}: #{e.message}")
     end
@@ -194,10 +194,10 @@ module GRPC
 
     def send_status(active_client, code, details, metadata = {})
       details = 'Not sure why' if details.nil?
-      GRPC.logger.debug("Sending status  #{code}:#{details}")
+      GRPC.log_debug { "Sending status  #{code}:#{details}" }
       active_client.send_status(code, details, code == OK, metadata: metadata)
     rescue StandardError => e
-      GRPC.logger.warn("Could not send status #{code}:#{details}")
+      GRPC.log_warn { "Could not send status #{code}:#{details}" }
       GRPC.logger.warn(e)
     end
   end

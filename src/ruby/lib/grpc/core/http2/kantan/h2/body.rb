@@ -13,6 +13,18 @@ module GRPC
 module Kantan
   module H2
     module Body
+      # grpc: appends the bytes of +str+ to a binary buffer whatever its
+      # encoding. String#b would copy the whole payload first.
+      if String.method_defined?(:append_as_bytes)
+        def self.append_bytes buf, str
+          buf.append_as_bytes(str)
+        end
+      else
+        def self.append_bytes buf, str
+          buf << (str.encoding == Encoding::BINARY ? str : str.b)
+        end
+      end
+
       class Buffer
         def initialize string
           @string = string
@@ -23,6 +35,32 @@ module Kantan
           chunk = @string.byteslice(@offset, n)
           @offset += n
           chunk
+        end
+
+        # grpc: appends up to +n+ bytes straight to +buf+ and returns how many.
+        # Framing a chunk used to allocate it here and copy it into the write
+        # buffer immediately afterwards.
+        #
+        # Both paths go through Body.append_bytes. A payload arrives in
+        # whatever encoding the caller had, and a plain +buf << slice+ of a
+        # UTF-8 payload is not encoding safe: against an all-ASCII buffer it
+        # silently retags the buffer as UTF-8, and against a buffer that
+        # already holds a frame header with a high byte in it -- the normal
+        # case -- it raises Encoding::CompatibilityError and takes the
+        # connection down. A partial read can also split a codepoint, so the
+        # slice need not be valid text at all.
+        def read_into buf, n
+          available = @string.bytesize - @offset
+          n = available if n > available
+          if @offset.zero? && n == @string.bytesize
+            # The whole part at once, which is every message that fits in a
+            # frame. Appending it directly saves slicing a copy first.
+            Body.append_bytes(buf, @string)
+          else
+            Body.append_bytes(buf, @string.byteslice(@offset, n))
+          end
+          @offset += n
+          n
         end
 
         def bytesize
@@ -55,7 +93,10 @@ module Kantan
         end
 
         # +ack+, when given, is called once every byte of +part+ has been
-        # handed to the socket, which is how gRPC applies write backpressure.
+        # taken out of this queue and into the transport's write buffer, which
+        # is how gRPC applies write backpressure. That is one step short of
+        # the socket, and it is the right point: the bytes are no longer this
+        # queue's to hold.
         def push_part part, ack = nil
           @parts << [part, ack]
           @size += part.bytesize
@@ -91,16 +132,24 @@ module Kantan
 
         def read n
           out = +''.b
-          while out.bytesize < n && (entry = @parts.first)
+          read_into out, n
+          out
+        end
+
+        # grpc: appends up to +n+ bytes of the queue to +buf+ and returns how
+        # many were appended.
+        def read_into buf, n
+          taken = 0
+          while taken < n && (entry = @parts.first)
             part, ack = entry
-            out << part.read(n - out.bytesize)
+            taken += part.read_into(buf, n - taken)
             next unless part.empty?
             part.close
             @parts.shift
             ack&.call
           end
-          @size -= out.bytesize
-          out
+          @size -= taken
+          taken
         end
 
         def bytesize
@@ -131,6 +180,17 @@ module Kantan
           chunk = @io.read(n)
           @remaining -= chunk.bytesize
           chunk
+        end
+
+        # grpc: see Buffer#read_into. A file still needs one read buffer, but
+        # it is reused across calls instead of allocated per frame.
+        def read_into buf, n
+          @scratch ||= String.new(encoding: Encoding::BINARY, capacity: n)
+          chunk = @io.read(n, @scratch)
+          return 0 if chunk.nil?
+          buf << chunk
+          @remaining -= chunk.bytesize
+          chunk.bytesize
         end
 
         def bytesize
