@@ -12,11 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ruby_version_dirname = /(\d+\.\d+)/.match(RUBY_VERSION).to_s
-distrib_lib_dir = File.expand_path(ruby_version_dirname,
-                                   File.dirname(__FILE__))
-if !Dir.glob("#{distrib_lib_dir}/grpc_c*").empty?
-  require "#{distrib_lib_dir}/grpc_c"
-else
-  require 'grpc/grpc_c'
-end
+# GRPC::Core is implemented in pure Ruby; there is no native extension to
+# load.
+require_relative 'core/pure_ruby'

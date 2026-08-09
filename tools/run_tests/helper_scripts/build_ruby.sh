@@ -29,24 +29,8 @@ cd "$(dirname "$0")/../../.."
 
 rm -rf ./tmp
 
-SYSTEM=$(uname | cut -f 1 -d_)
-if [ "$SYSTEM" == "Darwin" ]; then
-  # work around https://github.com/rake-compiler/rake-compiler/issues/210
-  export GRPC_RUBY_TEST_ONLY_WORKAROUND_MAKE_INSTALL_BUG=true
-fi
-bundle exec rake compile
-
-# Log stuff and save a hash of the binary verify later at test runtime, in order
-# to detect corruption.
-if [ "$SYSTEM" == "Darwin" ]; then
-  ls -l src/ruby/lib/grpc/grpc_c.bundle
-  file src/ruby/lib/grpc/grpc_c.bundle
-  shasum -a 256 src/ruby/lib/grpc/grpc_c.bundle | awk '{print $1}' > src/ruby/lib/grpc/grpc_c_sha256
-else
-  ls -l src/ruby/lib/grpc/grpc_c.so
-  file src/ruby/lib/grpc/grpc_c.so
-  sha256sum src/ruby/lib/grpc/grpc_c.so | awk '{print $1}' > src/ruby/lib/grpc/grpc_c_sha256
-fi
+# gRPC Ruby is pure Ruby, so there is no extension to compile. Only the
+# protoc plugin used by the code generation tests still needs a C++ build.
 
 # build grpc_ruby_plugin
 mkdir -p cmake/build

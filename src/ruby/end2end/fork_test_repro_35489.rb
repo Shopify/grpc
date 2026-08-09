@@ -14,10 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ENV['GRPC_ENABLE_FORK_SUPPORT'] = "1"
-fail "forking only supported on linux" unless RUBY_PLATFORM =~ /linux/
-# TODO(apolcyn): remove after this experiment is on by default
-ENV['GRPC_EXPERIMENTS'] = "event_engine_fork"
+# gRPC Ruby is implemented in pure Ruby, so forking no longer depends on
+# C-core's Linux-only fork handlers; it works wherever Ruby supports fork.
+fail 'forking not supported on this platform' unless Process.respond_to?(:fork)
 
 this_dir = File.expand_path(File.dirname(__FILE__))
 protos_lib_dir = File.join(this_dir, 'lib')

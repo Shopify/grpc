@@ -904,3 +904,16 @@ Style/ZeroLengthPredicate:
 # URISchemes: http, https
 Layout/LineLength:
   Max: 186
+
+# Offense count: 1
+# GRPC::Core::Call implements the whole run_batch operation surface, which the
+# C extension expressed in one file too.
+Metrics/ClassLength:
+  Exclude:
+    - 'lib/grpc/core/call.rb'
+
+# Offense count: 1
+# GRPC::Core::Transport holds target parsing plus client and server TLS setup.
+Metrics/ModuleLength:
+  Exclude:
+    - 'lib/grpc/core/transport.rb'
