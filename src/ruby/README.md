@@ -62,6 +62,7 @@ CONTENTS
     HTTP/2 implementation, namespaced under `GRPC::Core::Http2`
   - see [IMPLEMENTATION.md](IMPLEMENTATION.md) for how the core is put
     together, what is verified, and what is not done yet
+- bench: a benchmark for the Ruby stack, see [bench/README.md](bench/README.md)
 - spec: Rspec unittests
 - bin: example gRPC clients and servers, e.g,
 
