@@ -41,6 +41,28 @@ module GRPC
       # reclaimed. Only reached while a message is assembled from many frames.
       COMPACT_THRESHOLD = 64 * 1024
 
+      # A message larger than one frame arrives in several chunks, and a
+      # buffer that starts empty reallocates and copies what it already holds
+      # on the way up. A chunk that fills a whole frame is a fair guess that
+      # more of the message follows, so the buffer is given the room at once.
+      # It is only a guess: nothing in the protocol promises it.
+      #
+      # The signal is bytes this side actually received, not a length the peer
+      # claimed, so memory follows delivery: a stream that receives little
+      # holds little and one that receives nothing holds nothing. The ratio
+      # covers a message of a few frames without another growth, and bounds
+      # what a peer can make this side hold to that multiple of what it sent.
+      BUFFER_SIZE_TRIGGER = 16 * 1024
+      BUFFER_SIZE_RATIO = 5
+
+      # A ceiling on that, whatever the ratio would allow.
+      BUFFER_SIZE_MAX = 1 << 20
+
+      # The payload size at which reserving the whole frame up front starts to
+      # pay for the keyword hash it costs. One frame: below this the message
+      # is written in a single DATA frame and barely grows.
+      FRAME_RESERVE_MIN = 16 * 1024
+
       EMPTY = ''.b.freeze
 
       # A transport failure translated into a gRPC status.
