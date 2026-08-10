@@ -179,6 +179,16 @@ module GRPC
       def accept_loop(listener, credentials)
         loop do
           socket = listener.accept
+          # The client end sets this in Transport.open_socket; the accepted end
+          # needs it just as much. A reply is a large DATA write followed by a
+          # small trailing HEADERS frame, and with Nagle enabled that trailer
+          # waits for an acknowledgement of the data before it goes out. The
+          # caller cannot finish the RPC until the trailer arrives.
+          begin
+            socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+          rescue IOError, SystemCallError
+            nil # a Unix socket, or one that died between accept and here
+          end
           Thread.new { serve(socket, credentials) }
         end
       rescue IOError, SystemCallError
