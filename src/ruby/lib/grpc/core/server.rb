@@ -41,6 +41,23 @@ module GRPC
         'H' => 3600.0
       }.freeze
 
+      # The same table keyed by the unit's byte, so #deadline_from can read
+      # the last byte of the header instead of slicing a String off it. Any
+      # other byte is not a unit and reads as nil.
+      TIMEOUT_UNIT_SECONDS = TIMEOUT_UNITS.each_with_object([]) do |(u, s), a|
+        a[u.ord] = s
+      end.freeze
+      ZERO_BYTE = '0'.ord
+
+      # The gRPC spec caps grpc-timeout at eight digits, so a longer value is
+      # malformed and is treated as no deadline at all.
+      TIMEOUT_MAX_DIGITS = 8
+
+      # Returned when a request carries no usable deadline. A fresh Time each
+      # time on purpose: it reaches user code through NewServerRpc#deadline
+      # and ActiveCall#deadline, and Time#utc and Time#gmtime mutate their
+      # receiver, so a shared frozen one would raise FrozenError there.
+
       # How often shutdown re-checks whether the last RPC has finished.
       DRAIN_POLL_INTERVAL = 0.005
 
@@ -270,11 +287,29 @@ module GRPC
         Metadata.decode(headers, RESERVED_HEADERS)
       end
 
+      # Parses the "<digits><unit>" grpc-timeout header. Read byte by byte
+      # rather than through a regexp: matching allocated a MatchData and then
+      # a String for each of the two groups, on every request, only to turn
+      # one of them into an Integer and the other into a table lookup.
       def deadline_from(timeout)
-        return Time.at(TimeSpec::INF_FUTURE_TIME_SEC) if timeout.nil?
-        match = /\A(\d+)([numSMH])\z/.match(timeout)
-        return Time.at(TimeSpec::INF_FUTURE_TIME_SEC) if match.nil?
-        Time.now + (match[1].to_i * TIMEOUT_UNITS.fetch(match[2]))
+        return no_deadline if timeout.nil?
+        last = timeout.bytesize - 1
+        return no_deadline if last < 1 || last > TIMEOUT_MAX_DIGITS
+        seconds = TIMEOUT_UNIT_SECONDS[timeout.getbyte(last)]
+        return no_deadline if seconds.nil?
+        digits = 0
+        i = 0
+        while i < last
+          byte = timeout.getbyte(i) - ZERO_BYTE
+          return no_deadline if byte.negative? || byte > 9
+          digits = (digits * 10) + byte
+          i += 1
+        end
+        Time.now + (digits * seconds)
+      end
+
+      def no_deadline
+        Time.at(TimeSpec::INF_FUTURE_TIME_SEC)
       end
 
       # Waits for outstanding RPCs to finish, then drops the connections.
