@@ -109,7 +109,7 @@ place of about 6800 lines of C.
 
 | Suite | How to run | State |
 | --- | --- | --- |
-| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 501 examples, 6 failures |
+| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 504 examples, 6 failures |
 | End to end | run each `src/ruby/end2end/*_test.rb` | 23 of 24 |
 | gRPC interop | `src/ruby/pb/test/{server,client}.rb` | 14 of 14, insecure and TLS |
 | h2spec | point it at a server on the vendored session | 146 of 146, both write paths, 10 runs each |
@@ -135,11 +135,16 @@ under YJIT:
 
 | Scenario | pure Ruby | C extension | ratio |
 | --- | --- | --- | --- |
-| unary, empty payload | 7561 qps | 6559 qps | 1.15 |
-| unary, 64 KiB payload | 2816 qps | 3850 qps | 0.73 |
-| unary, 8 threads | 15806 qps | 16111 qps | 0.98 |
-| server streaming | 297584 msg/s | 52084 msg/s | 5.71 |
-| client streaming | 296125 msg/s | 50762 msg/s | 5.83 |
+| unary, empty payload | 7635 qps | 6610 qps | 1.16 |
+| unary, 64 KiB payload | 3146 qps | 3806 qps | 0.83 |
+| unary, 8 threads | 16586 qps | 15077 qps | 1.10 |
+| server streaming | 352989 msg/s | 53483 msg/s | 6.60 |
+| client streaming | 352659 msg/s | 52047 msg/s | 6.78 |
+
+Those rows come from runs that measure all four server and client pairings
+in a fixed order. Position within a run is worth a few per cent on this
+machine, so read the table for scale and not for small differences. To
+compare two trees, alternate them and take a sign test over the pairs.
 
 ### Why streaming is so far ahead
 
@@ -211,13 +216,58 @@ path and this does not. That dominates for small messages, is worn away
 by the per byte cost as messages grow, and has gone by about 39 KiB.
 Past that the C extension is ahead.
 
-The one case still behind is a 64 KiB unary payload, at about three
-quarters of the C extension.
+The one case still behind is a 64 KiB unary payload, at about four fifths
+of the C extension.
+
+Three faults were found and fixed there. Together they are worth **8.4 per
+cent** on that scenario and 7.3 per cent off its median latency, over 20
+alternated pairs (20/20 on both, sign test p < 0.001). Every other scenario
+is flat.
+
+- **Nagle on accepted sockets.** The client end set `TCP_NODELAY`; the
+  accepted end did not. A reply is a large DATA write followed by a small
+  trailing HEADERS frame, and the caller cannot finish the RPC without
+  that trailer, so the trailer waited on an acknowledgement of the data.
+  Worth 6.3 per cent on its own, 18/20.
+- **A receive buffer grown from empty.** A message of several frames was
+  appended into a String that started with no room, so it reallocated and
+  copied everything it already held each time. A CPU profile put that one
+  line at 9.7 per cent of the whole implementation. `RpcStream#push_data`
+  now sizes the buffer once when a chunk arrives that fills a whole frame.
+  Worth about 3 per cent: +3.3 and +3.4 per cent over two sets of 24
+  alternated pairs, 35 of those 48 pairs won.
+- **The read buffer freed between reads.** `FrameReader#refill` emptied it
+  before every `readpartial`, and `String#clear` frees the storage rather
+  than keeping it: a 65577 byte String becomes 40 bytes. Every frame read
+  therefore returned a 64 KiB buffer and took a new one. The clear is there
+  so that a failed refill leaves nothing readable, which `readpartial`
+  guarantees for end of file but **not** for a closed stream, so it now
+  runs on the failure path only. Pooled over 48 pairs: 64 KiB unary 32/48
+  (p=0.011) and 8 threads 34/48 (p=0.002), against client streaming 17/48
+  (p=0.017, about -1 per cent).
+
+The sizing is speculative, and deliberately does not read the length the
+peer declared in the message prefix. Trusting that number would let five
+bytes buy a large buffer on every stream at once. Instead the guess is made
+from bytes already delivered: a chunk below one frame does nothing, and the
+buffer is never made more than five times the chunk in hand, so what a peer
+can make this side hold follows what it sent.
+
+Fixing the first exposed a bug in status handling; see `Core::Call`
+`#resolve_client_status` and `spec/status_precedence_spec.rb`. Once the
+trailers and the peer's GOAWAY arrived in one segment, a finished RPC was
+reported as UNAVAILABLE, because the status assembly read the trailers and
+then discarded them in favour of the transport failure. A status the peer
+sent is final; only a close with no status decides the outcome. That bug
+also made `client_memory_usage_test` fail 4 runs in 40; it now passes 60.
 
 Copying is not the main cost there, which is worth knowing before anyone
-spends time on zero copy plumbing. An RPC takes about 330 us against
-about 255 us, a gap of roughly 75 us, and one 64 KiB copy is about 8 us.
-Two experiments:
+spends time on zero copy plumbing. After the two fixes above an RPC takes
+about 319 us against about 253 us, a gap of roughly 66 us. A 64 KiB
+userspace copy is about 1.4 us, so the gap is not copies. Measured on this
+machine, a socket write costs 0.115 us/KiB at 64 KiB against 0.85 us/KiB
+at 16 KiB: the syscall dominates, and a userspace copy is ten times
+cheaper than either. Four experiments on copying:
 
 - Removing one copy from the send path, by queueing the caller's payload
   rather than copying it into the frame, was worth 4.8 per cent over
@@ -226,6 +276,23 @@ Two experiments:
 - Removing another, by holding received DATA as segments instead of
   appending it into one buffer, won 5 of 10 paired runs: no effect. Also
   reverted.
+- Sizing that buffer from the length the peer declares measured +3.1 and
+  +3.8 per cent, and was still not shipped: a peer can declare a length it
+  never sends, so five bytes on each of many streams would reserve memory
+  on all of them. What shipped uses delivered bytes instead and gets most
+  of it. An earlier attempt at the same idea measured nothing at all,
+  because its gate was five bytes too tight to ever fire. Check that a
+  change is active before believing a null result.
+- `IO#syswrite` beats `IO#write` by 31 per cent on a 65 KB write, 5.5 us
+  against 7.3 us. That is about 1 per cent of an RPC and it brings partial
+  write handling, so it was not taken.
+- Carrying END_STREAM on the last message's own DATA frame, rather than an
+  empty frame behind it, is worth 2.4 per cent on 64 KiB unary and was
+  reverted anyway. It threads a keyword through five call levels down to
+  the per message path, which a streaming client runs hundreds of thousands
+  of times a second: client streaming lost 6.4 per cent and server
+  streaming 3.0 per cent, both 19 of 24 pairs at p=0.003. One path gaining
+  two does not pay for two paths losing six and three.
 
 Holding the payload size fixed and turning four DATA frames into one, by
 raising the frame size, was worth 7 per cent, so per frame work matters
@@ -238,7 +305,30 @@ puts 53 per cent of samples in `Thread::Queue#pop`, 30 per cent in
 and under 1 per cent in all of this library's own Ruby frames put
 together. Read that only as "there is no hot Ruby method here". Sample
 shares over mostly idle threads say nothing about which part of a serial
-round trip the 75 us sits in; idleness is not latency.
+round trip the gap sits in; idleness is not latency.
+
+A wall clock profile is the wrong lens for that reason. A **CPU** profile is
+not: StackProf in `:cpu` mode samples whichever thread holds the GVL, so
+idle transport threads cannot drown the picture. That profile found the
+receive buffer growth above, at 9.7 per cent on one line, which a wall
+profile had never shown. Its Ruby frames proved trustworthy; treat its
+`IO#write` and `IO#readpartial` shares with suspicion, since a thread that
+released the GVL to block in a syscall is not really running.
+
+Do not measure CPU with both peers in one process. Doing so puts a pure
+Ruby client and server on one GVL, which the real benchmark, with the
+server in its own process, does not. In the two process shape neither
+implementation is close to CPU bound:
+
+| | wall | client CPU | cpu/wall |
+| --- | --- | --- | --- |
+| pure Ruby | 316 us | 141 us | 0.45 |
+| C extension | 264 us | 126 us | 0.48 |
+
+Both spend about half the round trip waiting, and this implementation burns
+roughly 12 per cent more client CPU per call. So cutting CPU does not buy
+wall time one for one; it only pays where the work sits on the critical
+path, which is why the buffer fix landed and several smaller ones did not.
 
 Timestamping the stages of a single sequential call does apportion it.
 Handler work is 0 us and the two halves are roughly symmetric. The
@@ -265,11 +355,34 @@ depends on how heavily the code is instrumented: a fuller probe, which
 itself stretched the round trip from 330 us to 419 us, put the same delay
 at 50 us.
 
-Three attempts on this case were measured and dropped: holding received
-DATA as segments (5 of 10 paired runs), waking a blocked reader only when
-its byte count can be satisfied (8 of 20 paired runs, sign test p = 0.87),
-and the inline write above (capped at about 5 per cent before it was
-built).
+Attempts on this case that were measured and dropped: holding received DATA
+as segments (5 of 10 paired runs), waking a blocked reader only when its
+byte count can be satisfied (8 of 20 paired runs, sign test p = 0.87),
+pooling receive buffers between streams instead of sizing them (7 of 20,
+and slower than simply allocating one of the right size), carrying the
+message length between streams as a size hint (target gain not significant
+and server streaming down), building the send frame by growing its five
+byte header rather than reserving the whole frame (22 per cent faster in a
+microbenchmark, 7 of 24 pairs and client streaming down 6 per cent in the
+real thing), the inline write above (capped at about 5 per cent before it
+was built), and busy polling the socket before blocking.
+
+One of those deserves its opposite. Keeping the *read* buffer's allocation
+between reads pays, so the same was tried on the *write* buffer: replace
+`wbuf.clear` after a flush with a fresh String of `WRITE_BUFFER_SIZE`. It
+lost, and not narrowly -- 64 KiB unary 5 of 24, empty unary 5 of 24, eight
+threads 3 of 24. The two buffers are not alike. `readpartial` fills toward
+64 KiB every time, so holding that much room is always used; most write
+flushes are a few hundred bytes of headers or an acknowledgement, so
+reserving 64 KiB for each one is waste. `wbuf.clear` stays.
+
+Busy polling is worth stating on its own, because it looks obvious. If the
+gap were the kernel taking time to wake a blocked reader, spinning on
+`read_nonblock` first would recover it. It does the opposite, and gets
+worse the longer it spins: 3059 qps with no spin, 2887 at 20 us, 2839 at
+100 us, and concurrent unary falls from 16548 to 11432. A spinning thread
+holds the GVL against the thread that has to run next, so in Ruby this
+trade is not available at any price.
 
 This case is unresolved. Nothing here shows it is a floor; what it shows
 is that the cheap moves are used up and the next ones cost real risk.
@@ -284,6 +397,29 @@ connection may hold, and each session keeps a 64 KiB read buffer and a
 64 KiB write buffer. Lowering `ADVERTISED_INITIAL_WINDOW_SIZE` trades
 throughput on large messages back for memory.
 
+### Measuring a change
+
+Position in a benchmark run is worth a few per cent on this machine. A
+patch measured always-first against a clean tree always-second showed, with
+**identical code on both sides**, the first position losing 6 of 20 on
+64 KiB unary (-1.6 per cent) and 5 of 20 on empty unary (-3.7 per cent).
+That bias reversed the sign of two real results during this work.
+
+So: alternate the order, ABBA, and take a sign test over the pairs. With
+the order alternated the same null patch sits at 8 to 11 wins of 20 on
+every metric. Twenty pairs resolve about 2 per cent. Anything smaller than
+that is not measurable here, whatever a single pair of numbers says.
+
+Microbenchmarks of allocation did not predict this system, in either
+direction, and cost two wrong turns. Assembling a 64 KiB buffer from
+16 KiB pieces measured 4.2 us in a loop and behaved like 20 us in the
+library, because a loop reuses one hot block from the allocator while the
+real thing keeps buffers alive and faults in new pages. The send frame
+went the other way: growing it from its header measured 22 per cent faster
+in a loop and lost 6 per cent of client streaming when shipped. Use a loop
+to rank two lines of code, never to decide whether a change is worth
+making. Only the paired A/B on the real workload decides that.
+
 ### Rules for the hot path
 
 These are the things that were actually worth doing, measured. Keep them
@@ -292,6 +428,28 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
 - Read frames through the single buffer in `FrameReader`. Decode integers
   in place with `getbyte` and `unpack1(offset:)`. Copy out only what has
   to outlive the buffer, which is a DATA payload or a header block.
+- Know what `String#clear` does before putting it on a read or write path.
+  It frees the storage: a 65577 byte String becomes 40 bytes, so the next
+  append allocates again. On a path that refills to the same size every
+  time, do not clear; hand the buffer straight to `IO#readpartial`, which
+  overwrites it and keeps the allocation. On a path whose usual content is
+  small, clear is the cheaper of the two. Both were measured; see above.
+- Weigh a per message allocation by measuring its removal, not by counting
+  it. Three removals from the streaming path, each isolated against the
+  same tree, are worth very different amounts:
+
+  | removed, per message | server streaming | client streaming |
+  | --- | --- | --- |
+  | one lambda (the write acknowledgement) | +5.2% (20/24) | +6.6% (21/24) |
+  | one Array and its block (`OP_ORDER.select`) | +3.2% (23/24) | +2.5% (19/24) |
+  | three Hashes (the `run_batch` ops) | +0.0% (12/24) | -0.4% (12/24) |
+
+  Together the first two are worth 8.9 and 7.0 per cent. The three Hashes
+  are free, so object count predicts none of this. What the two that pay
+  have in common is a captured scope: `queue_write` built a lambda holding
+  `size`, and `select` ran a block holding `ops`. Hash literals capture
+  nothing. Prefer a receiver and a value, as `Body::Queue` now carries for
+  acknowledgements, over a closure that has to hold them.
 - Build frames by appending bytes. `buf << byte` chained nine times
   measured about 1.8 times faster than
   `[len_type, flags, id].pack("NCN", buffer: buf)`, which allocates an

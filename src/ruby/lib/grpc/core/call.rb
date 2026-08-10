@@ -424,6 +424,10 @@ module GRPC
         if requested_encoding && MessageCompression.supported?(requested_encoding)
           @send_encoding = requested_encoding
         end
+        # Rebuilding these eight pairs allocates eight arrays per request,
+        # and sharing frozen ones instead measured 12 per cent slower on
+        # client streaming over 20 alternated pairs. The reason is not
+        # understood; the values are identical either way. Left alone.
         headers = [
           [':method', 'POST'],
           [':scheme', @channel.scheme],
