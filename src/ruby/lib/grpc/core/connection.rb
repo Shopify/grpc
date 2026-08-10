@@ -46,12 +46,24 @@ module GRPC
         13 => StatusCodes::UNKNOWN
       }.freeze
 
+      # gRPC waits 20 seconds for a keepalive PING to be acknowledged.
+      DEFAULT_KEEPALIVE_TIMEOUT = 20.0
+
+      # How often the maintenance timer wakes to re-check every deadline
+      # (keepalive, idle, age). Finer than any one interval so several
+      # features sharing the thread do not lose precision to each other.
+      MAINTENANCE_POLL_INTERVAL = 0.005
+
       attr_reader :session, :peer, :peer_cert
 
       # rubocop:disable Metrics/ParameterLists -- all but +io+ are keywords
       def initialize(io, peer:, client:, max_receive_message_length:,
                      max_send_message_length: RpcStream::NO_LIMIT,
                      max_concurrent_streams: 100, peer_cert: nil,
+                     keepalive_time: nil, keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
+                     keepalive_permit_without_calls: false,
+                     max_connection_idle: nil, max_connection_age: nil,
+                     max_connection_age_grace: nil, client_idle_timeout: nil,
                      on_new_rpc: nil, on_close: nil)
         super()
         @io = io
@@ -60,6 +72,26 @@ module GRPC
         @client = client
         @max_receive_message_length = max_receive_message_length
         @max_send_message_length = max_send_message_length
+        @keepalive_time = keepalive_time
+        @keepalive_timeout = keepalive_timeout
+        @keepalive_permit_without_calls = keepalive_permit_without_calls
+        @max_connection_idle = max_connection_idle
+        @max_connection_age = max_connection_age
+        @max_connection_age_grace = max_connection_age_grace
+        @client_idle_timeout = client_idle_timeout
+        @maintenance_thread = nil
+        # Set while a PING we sent has not been acknowledged. The reader
+        # thread clears it through #on_ping.
+        @ping_deadline = nil
+        # Set once GOAWAY has gone out for exceeding max_connection_age; new
+        # streams are refused from then on and only the grace deadline (if
+        # any) or the last RPC draining can still close the connection.
+        @goaway_sent = false
+        @age_grace_deadline = nil
+        @created_at = nil
+        # The moment @streams last became empty, i.e. the start of the
+        # current idle period; nil while an RPC is in flight.
+        @idle_since = nil
         @on_new_rpc = on_new_rpc
         @on_close = on_close
         @streams = {}
@@ -78,9 +110,26 @@ module GRPC
       end
 
       def start
-        @mu.synchronize { @started = true }
+        @mu.synchronize do
+          @started = true
+          @created_at = RpcStream.now
+          @idle_since = @created_at
+        end
         @client ? @session.connect : @session.receive
+        start_maintenance
         self
+      end
+
+      # One thread services keepalive pings, server-side idle/age limits and
+      # the client-side idle timeout, so a connection with several of these
+      # configured still costs a single thread rather than one per feature.
+      def start_maintenance
+        return unless @keepalive_time || @max_connection_idle ||
+                      @max_connection_age || @client_idle_timeout
+        @maintenance_thread = Thread.new do
+          Thread.current.name = 'conn-maintenance'
+          maintenance_loop
+        end
       end
 
       # Blocks until the peer's first SETTINGS frame arrives, which is the
@@ -106,6 +155,12 @@ module GRPC
         end
       end
 
+      # The peer acknowledged our PING, so the connection is alive. Called by
+      # the session's reader thread.
+      def on_ping(_rtt_ns)
+        @mu.synchronize { @ping_deadline = nil }
+      end
+
       def alive?
         @mu.synchronize { !@closed }
       end
@@ -124,8 +179,13 @@ module GRPC
         end
       end
 
+      # Marks when the last RPC finished, so the maintenance loop can measure
+      # how long the connection has sat with nothing running on it.
       def forget(stream_id)
-        @mu.synchronize { @streams.delete(stream_id) }
+        @mu.synchronize do
+          @streams.delete(stream_id)
+          @idle_since = RpcStream.now if @streams.empty?
+        end
       end
 
       # Sends GOAWAY and tears the socket down, failing every live RPC.
@@ -147,7 +207,27 @@ module GRPC
             nil
           end
         end
+        stop_maintenance
         fail_all(status, details)
+        nil
+      end
+
+      # The loop wakes on its own interval, so closing only has to mark the
+      # connection closed and wait for it to notice; a leaked thread per
+      # connection would outlive every RPC on it. A limit crossing closes
+      # the connection from inside this very thread (e.g. a keepalive
+      # timeout or an expired grace period), so joining it here would
+      # deadlock -- Thread#join on the current thread raises ThreadError --
+      # and there is nothing left to wait for anyway.
+      def stop_maintenance
+        thread = @mu.synchronize do
+          t = @maintenance_thread
+          @maintenance_thread = nil
+          t
+        end
+        return if thread.nil? || thread == Thread.current
+        thread.wakeup if thread.alive?
+        thread.join(1)
         nil
       end
 
@@ -229,6 +309,115 @@ module GRPC
 
       private
 
+      # Runs every MAINTENANCE_POLL_INTERVAL and drives whichever of
+      # keepalive, the server-side idle/age limits, and the client-side idle
+      # timeout this connection was configured with. Polling on a short,
+      # shared tick keeps every configured deadline accurate to
+      # MAINTENANCE_POLL_INTERVAL, however many of them are active together.
+      def maintenance_loop
+        next_ping_at = @keepalive_time && (RpcStream.now + @keepalive_time)
+        until @mu.synchronize { @closed }
+          sleep(MAINTENANCE_POLL_INTERVAL)
+          break if @mu.synchronize { @closed }
+          now = RpcStream.now
+          if @keepalive_time
+            next_ping_at, closed = check_keepalive(now, next_ping_at)
+            break if closed
+          end
+          break if check_idle_limits(now)
+          break if check_max_age(now)
+        end
+      rescue StandardError => e
+        GRPC.logger.debug("connection maintenance stopped: #{e.class}: #{e.message}")
+      end
+
+      # Sends a PING and expects it acknowledged within +keepalive_timeout+.
+      # gRPC only pings an otherwise-idle connection when the caller opted
+      # in, because a ping with no RPC in flight is what upsets strict peers.
+      #
+      # @return [Array(Float, Boolean)] the next ping deadline, and whether
+      #   this closed the connection
+      def check_keepalive(now, next_ping_at)
+        expired = @mu.synchronize do
+          deadline = @ping_deadline
+          !deadline.nil? && now >= deadline
+        end
+        if expired
+          close(StatusCodes::UNAVAILABLE, 'keepalive ping timed out')
+          return [next_ping_at, true]
+        end
+        return [next_ping_at, false] if now < next_ping_at
+        if ping_permitted?
+          @mu.synchronize { @ping_deadline = now + @keepalive_timeout if @ping_deadline.nil? }
+          begin
+            @session.ping
+          rescue StandardError
+            # The write side is already gone; the reader will finish the job.
+            return [next_ping_at, false]
+          end
+        end
+        [now + @keepalive_time, false]
+      end
+
+      def ping_permitted?
+        return true if @keepalive_permit_without_calls
+        @mu.synchronize { !@streams.empty? }
+      end
+
+      # grpc.max_connection_idle_ms (server) and grpc.client_idle_timeout_ms
+      # (client) are the same measurement -- time since the last RPC closed
+      # -- read from opposite ends of the connection. A client-side timeout
+      # closes the connection outright: Channel#on_connection_closed sees
+      # the resulting on_close callback and drops the channel back to IDLE,
+      # so the next call reconnects instead of reusing a dead transport.
+      #
+      # @return [Boolean] whether this closed the connection
+      def check_idle_limits(now)
+        limit = @client ? @client_idle_timeout : @max_connection_idle
+        return false if limit.nil?
+        idle_for = @mu.synchronize { @streams.empty? ? now - @idle_since : 0 }
+        return false if idle_for < limit
+        close(StatusCodes::UNAVAILABLE,
+              @client ? 'client idle timeout' : 'connection idle for too long')
+        true
+      end
+
+      # grpc.max_connection_age_ms: GOAWAY goes out once the connection gets
+      # too old, and in-flight RPCs are given until
+      # grpc.max_connection_age_grace_ms to finish -- forever, if that is
+      # unset -- before the connection is cut regardless. A connection is
+      # never cut mid-RPC before that grace deadline.
+      #
+      # @return [Boolean] whether this closed the connection
+      def check_max_age(now)
+        return false if @client || @max_connection_age.nil?
+        send_age_goaway(now) unless @mu.synchronize { @goaway_sent }
+        return false unless @mu.synchronize { @goaway_sent }
+        drained = @mu.synchronize { @streams.empty? }
+        grace_expired = @mu.synchronize do
+          !@age_grace_deadline.nil? && now >= @age_grace_deadline
+        end
+        return false unless drained || grace_expired
+        close(StatusCodes::UNAVAILABLE, 'connection reached max age')
+        true
+      end
+
+      def send_age_goaway(now)
+        return if now - @created_at < @max_connection_age
+        @mu.synchronize do
+          return if @goaway_sent
+          @goaway_sent = true
+          @age_grace_deadline = @max_connection_age_grace &&
+                                (now + @max_connection_age_grace)
+        end
+        begin
+          @session.send_goaway
+        rescue StandardError
+          # The write side is already gone; the reader will finish the job.
+          nil
+        end
+      end
+
       def new_stream(id)
         stream = RpcStream.new(
           self, id,
@@ -240,9 +429,12 @@ module GRPC
       end
 
       # Server side: a HEADERS block on an unknown stream starts a new RPC.
+      # Once GOAWAY has gone out for max_connection_age, no new stream is
+      # accepted -- that is the point of GOAWAY -- even though existing ones
+      # keep running until they finish or the grace period expires.
       def accept(kstream)
         stream = @mu.synchronize do
-          return nil if @closed
+          return nil if @closed || @goaway_sent
           @streams[kstream.id] = new_stream(kstream.id)
         end
         @on_new_rpc&.call(stream, kstream.headers)

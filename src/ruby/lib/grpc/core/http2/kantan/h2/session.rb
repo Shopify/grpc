@@ -362,6 +362,15 @@ module Kantan
         @write_queue << [:shutdown]
       end
 
+      # grpc: sends GOAWAY without stopping the session, unlike #shutdown, so
+      # that RPCs already in flight (e.g. under max_connection_age) can keep
+      # reading and writing after the peer has been told not to start any
+      # more. @highest_stream_id at write time covers every stream accepted
+      # so far, so nothing already running is refused by this GOAWAY itself.
+      def send_goaway error_code = 0x0
+        @write_queue << [:goaway, error_code]
+      end
+
       def request headers, body: nil
         stream_id = new_stream
         send_headers stream_id, headers, has_body: !!body
@@ -860,8 +869,14 @@ module Kantan
             when 0x5 then handle_push_promise io, len, flags, stream_ident
             when 0x6 then handle_ping io, len, flags, stream_ident
             when 0x7
+              # grpc: GOAWAY only forbids new streams above last_stream_id;
+              # it says nothing about streams already open. Breaking here
+              # used to tear the whole session down the instant either side
+              # sent one -- including this end's own graceful GOAWAY for
+              # max_connection_age -- cutting every in-flight RPC instead of
+              # letting it finish. The loop now keeps reading until the peer
+              # actually closes the socket or a local #shutdown is queued.
               handle_goaway io, len, flags, stream_ident
-              break
             when 0x8 then handle_window_update io, len, flags, stream_ident
             when 0x9 then handle_continuation io, len, flags, stream_ident
             else

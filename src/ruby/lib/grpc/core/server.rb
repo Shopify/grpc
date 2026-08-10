@@ -71,6 +71,19 @@ module GRPC
         @max_concurrent_streams = ChannelArgs.int(
           @args, ChannelArgs::MAX_CONCURRENT_STREAMS, 100)
         @so_reuseport = !ChannelArgs.int(@args, ChannelArgs::SO_REUSEPORT, 1).zero?
+        @keepalive_time = ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIME_MS)
+        @keepalive_timeout =
+          ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIMEOUT_MS) ||
+          Connection::DEFAULT_KEEPALIVE_TIMEOUT
+        @keepalive_permit_without_calls = !ChannelArgs.int(
+          @args, ChannelArgs::KEEPALIVE_PERMIT_WITHOUT_CALLS, 0
+        ).zero?
+        @max_connection_idle =
+          ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_IDLE_MS)
+        @max_connection_age =
+          ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_AGE_MS)
+        @max_connection_age_grace =
+          ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_AGE_GRACE_MS)
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @listeners = []
@@ -223,6 +236,12 @@ module GRPC
                   max_receive_message_length: @max_receive_message_length,
                   max_send_message_length: @max_send_message_length,
                   max_concurrent_streams: @max_concurrent_streams,
+                  keepalive_time: @keepalive_time,
+                  keepalive_timeout: @keepalive_timeout,
+                  keepalive_permit_without_calls: @keepalive_permit_without_calls,
+                  max_connection_idle: @max_connection_idle,
+                  max_connection_age: @max_connection_age,
+                  max_connection_age_grace: @max_connection_age_grace,
                   on_new_rpc: method(:enqueue_rpc),
                   on_close: method(:forget_connection))
         # A socket accepted just as the server shuts down is dropped without

@@ -22,15 +22,18 @@ require 'spec_helper'
 # from an error.
 describe 'configuration this implementation does not implement' do
   describe GRPC::Core::ChannelArgs do
+    # grpc.census stands in for "a gRPC argument we do not implement". It is
+    # used here rather than a transport setting because features land over
+    # time and this example should not need editing each time one does.
     it 'rejects a gRPC argument it does not act on' do
-      expect { described_class.normalize('grpc.keepalive_time_ms' => 1000) }
-        .to raise_error(ArgumentError, /keepalive_time_ms is not implemented/)
+      expect { described_class.normalize('grpc.census' => 1) }
+        .to raise_error(ArgumentError, /grpc.census is not implemented/)
     end
 
     it 'names every rejected argument, not just the first' do
-      args = { 'grpc.enable_retries' => 1, 'grpc.service_config' => '{}' }
+      args = { 'grpc.census' => 1, 'grpc.max_connections_per_subchannel_cap' => 4 }
       expect { described_class.normalize(args) }
-        .to raise_error(ArgumentError, /enable_retries, grpc.service_config/)
+        .to raise_error(ArgumentError, /grpc.census, grpc.max_connections_per_subchannel_cap/)
     end
 
     it 'tells the caller which arguments do work' do
@@ -94,7 +97,7 @@ describe 'configuration this implementation does not implement' do
   describe GRPC::Core::Channel do
     it 'fails to build rather than ignore an unimplemented argument' do
       expect do
-        described_class.new('localhost:1', { 'grpc.keepalive_time_ms' => 1 },
+        described_class.new('localhost:1', { 'grpc.census' => 1 },
                             :this_channel_is_insecure)
       end.to raise_error(ArgumentError)
     end

@@ -33,6 +33,10 @@ module GRPC
       KEEPALIVE_TIME_MS = 'grpc.keepalive_time_ms'
       KEEPALIVE_TIMEOUT_MS = 'grpc.keepalive_timeout_ms'
       KEEPALIVE_PERMIT_WITHOUT_CALLS = 'grpc.keepalive_permit_without_calls'
+      CLIENT_IDLE_TIMEOUT_MS = 'grpc.client_idle_timeout_ms'
+      MAX_CONNECTION_IDLE_MS = 'grpc.max_connection_idle_ms'
+      MAX_CONNECTION_AGE_MS = 'grpc.max_connection_age_ms'
+      MAX_CONNECTION_AGE_GRACE_MS = 'grpc.max_connection_age_grace_ms'
       COMPRESSION_ENABLED_ALGORITHMS_BITSET =
         'grpc.compression_enabled_algorithms_bitset'
       DEFAULT_COMPRESSION_ALGORITHM = 'grpc.default_compression_algorithm'
@@ -45,10 +49,17 @@ module GRPC
       # outside the namespace belong to the caller and are ignored, which is
       # what the C extension did with them.
       HONOURED = [
+        CLIENT_IDLE_TIMEOUT_MS,
         COMPRESSION_ENABLED_ALGORITHMS_BITSET,
         DEFAULT_AUTHORITY,
         DEFAULT_COMPRESSION_ALGORITHM,
+        KEEPALIVE_PERMIT_WITHOUT_CALLS,
+        KEEPALIVE_TIME_MS,
+        KEEPALIVE_TIMEOUT_MS,
         MAX_CONCURRENT_STREAMS,
+        MAX_CONNECTION_AGE_GRACE_MS,
+        MAX_CONNECTION_AGE_MS,
+        MAX_CONNECTION_IDLE_MS,
         MAX_RECEIVE_MESSAGE_LENGTH,
         MAX_SEND_MESSAGE_LENGTH,
         PRIMARY_USER_AGENT,
@@ -127,6 +138,15 @@ module GRPC
           fail TypeError,
                "#{key}: bad value: got <#{value.class}>, want <String|Fixnum>"
         end
+      end
+
+      # Reads a millisecond argument as seconds, which is what every timer in
+      # this core works in. Returns nil when unset, and treats a non-positive
+      # value as unset, as gRPC does.
+      def seconds(args, key)
+        ms = args[key]
+        return nil unless ms.is_a?(Integer) && ms.positive?
+        ms / 1000.0
       end
 
       # Reads an integer argument, falling back to +default+.

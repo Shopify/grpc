@@ -64,6 +64,15 @@ module GRPC
         @max_send_message_length = ChannelArgs.int(
           @args, ChannelArgs::MAX_SEND_MESSAGE_LENGTH, RpcStream::NO_LIMIT)
         @default_compression_algorithm = ChannelArgs.compression_algorithm(@args)
+        @keepalive_time = ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIME_MS)
+        @keepalive_timeout =
+          ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIMEOUT_MS) ||
+          Connection::DEFAULT_KEEPALIVE_TIMEOUT
+        @keepalive_permit_without_calls = !ChannelArgs.int(
+          @args, ChannelArgs::KEEPALIVE_PERMIT_WITHOUT_CALLS, 0
+        ).zero?
+        @client_idle_timeout =
+          ChannelArgs.seconds(@args, ChannelArgs::CLIENT_IDLE_TIMEOUT_MS)
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @state = ConnectivityStates::IDLE
@@ -282,6 +291,10 @@ module GRPC
           socket, peer: peer, client: true, peer_cert: peer_cert,
                   max_receive_message_length: @max_receive_message_length,
                   max_send_message_length: @max_send_message_length,
+                  keepalive_time: @keepalive_time,
+                  keepalive_timeout: @keepalive_timeout,
+                  keepalive_permit_without_calls: @keepalive_permit_without_calls,
+                  client_idle_timeout: @client_idle_timeout,
                   on_close: method(:on_connection_closed))
         connection.start
         # A completed TCP connect is not a usable channel: the peer may have
