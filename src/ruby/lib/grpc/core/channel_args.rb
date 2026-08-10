@@ -38,6 +38,27 @@ module GRPC
       DEFAULT_COMPRESSION_ALGORITHM = 'grpc.default_compression_algorithm'
       DEFAULT_COMPRESSION_LEVEL = 'grpc.default_compression_level'
 
+      # Every argument in the "grpc." namespace that this implementation
+      # actually acts on. Anything else in that namespace is a gRPC argument
+      # we do not implement, and accepting it silently is how a keepalive
+      # setting becomes a connection that dies with no explanation. Names
+      # outside the namespace belong to the caller and are ignored, which is
+      # what the C extension did with them.
+      HONOURED = [
+        COMPRESSION_ENABLED_ALGORITHMS_BITSET,
+        DEFAULT_AUTHORITY,
+        DEFAULT_COMPRESSION_ALGORITHM,
+        MAX_CONCURRENT_STREAMS,
+        MAX_RECEIVE_MESSAGE_LENGTH,
+        MAX_SEND_MESSAGE_LENGTH,
+        PRIMARY_USER_AGENT,
+        SECONDARY_USER_AGENT,
+        SO_REUSEPORT,
+        SSL_TARGET_NAME_OVERRIDE
+      ].freeze
+
+      GRPC_NAMESPACE = 'grpc.'
+
       # gRPC's own default for both directions is 4 MiB receive, unlimited
       # send; -1 means "no limit".
       DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH = 4 * 1024 * 1024
@@ -53,9 +74,38 @@ module GRPC
           fail TypeError,
                "bad channel args: got:<#{args.class}> want: a hash or nil"
         end
-        args.each_with_object({}) do |(key, value), out|
-          out[normalize_key(key)] = normalize_value(key, value)
+        out = args.each_with_object({}) do |(key, value), acc|
+          acc[normalize_key(key)] = normalize_value(key, value)
         end
+        reject_unimplemented(out)
+        out
+      end
+
+      # Fails on a gRPC argument this implementation does not act on, rather
+      # than accepting it and doing nothing.
+      def reject_unimplemented(args)
+        unimplemented = args.keys.select do |key|
+          key.start_with?(GRPC_NAMESPACE) && !HONOURED.include?(key)
+        end
+        return if unimplemented.empty?
+        fail ArgumentError,
+             "channel argument #{unimplemented.sort.join(', ')} is not " \
+             "implemented by the pure Ruby core, and ignoring it would " \
+             "change behaviour silently. Implemented: #{HONOURED.join(', ')}"
+      end
+
+      # Maps grpc.default_compression_algorithm, an integer from the
+      # grpc_compression_algorithm enum, to the name the transport uses.
+      # Returns nil when the enabled bitset excludes that algorithm.
+      def compression_algorithm(args)
+        value = args[DEFAULT_COMPRESSION_ALGORITHM]
+        return nil unless value.is_a?(Integer)
+        name = CompressionOptions::ALGORITHM_NAMES[value]
+        return nil if name.nil? || name == :identity
+        bitset = int(args, COMPRESSION_ENABLED_ALGORITHMS_BITSET,
+                     CompressionOptions::DEFAULT_ENABLED_ALGORITHMS_BITSET)
+        return nil if (bitset & (1 << value)).zero?
+        name.to_s
       end
 
       def normalize_key(key)
@@ -77,20 +127,6 @@ module GRPC
           fail TypeError,
                "#{key}: bad value: got <#{value.class}>, want <String|Fixnum>"
         end
-      end
-
-      # Maps grpc.default_compression_algorithm, an integer from the
-      # grpc_compression_algorithm enum, to the name the transport uses.
-      # Returns nil when the enabled bitset excludes that algorithm.
-      def compression_algorithm(args)
-        value = args[DEFAULT_COMPRESSION_ALGORITHM]
-        return nil unless value.is_a?(Integer)
-        name = CompressionOptions::ALGORITHM_NAMES[value]
-        return nil if name.nil? || name == :identity
-        bitset = int(args, COMPRESSION_ENABLED_ALGORITHMS_BITSET,
-                     CompressionOptions::DEFAULT_ENABLED_ALGORITHMS_BITSET)
-        return nil if (bitset & (1 << value)).zero?
-        name.to_s
       end
 
       # Reads an integer argument, falling back to +default+.

@@ -42,12 +42,30 @@ module GRPC
       # Understands the target forms grpc-ruby users actually pass: a bare
       # host:port, the dns:, ipv4:, ipv6: and unix: schemes, and bracketed
       # IPv6 literals.
+      KNOWN_SCHEMES = %w[dns ipv4 ipv6 unix].freeze
+
       def parse_target(target)
         str = target.to_s
+        reject_unknown_scheme(str)
         return Target.new(:unix, nil, nil, unix_path(str)) if str.start_with?('unix:')
         str = strip_scheme(str)
         host, port = split_host_port(str)
         Target.new(:tcp, host, port, nil)
+      end
+
+      # "xds:///service" used to parse as the host "xds" on port 0, so the
+      # channel was built and only failed later, connecting to a name the
+      # caller never wrote. A scheme this implementation does not resolve has
+      # to say so. Only the "scheme://" form is treated as a scheme, because
+      # "localhost:50051" is a host and a port.
+      def reject_unknown_scheme(str)
+        mark = str.index('://')
+        return if mark.nil?
+        scheme = str[0, mark]
+        return if KNOWN_SCHEMES.include?(scheme)
+        fail ArgumentError,
+             "unsupported target scheme #{scheme.inspect} in #{str.inspect}; " \
+             "this implementation resolves #{KNOWN_SCHEMES.join(', ')}"
       end
 
       def unix_path(str)

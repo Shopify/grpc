@@ -491,13 +491,23 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   and that is unresolved rather than understood to be a floor. The stage
   timings above point at the delay between queueing a frame and the write
   thread writing it. See the note above before trying anything else.
-- There is no keepalive. `grpc.keepalive_time_ms` is accepted and
-  ignored. A half-open connection is noticed when a read fails.
+- Configuration this implementation cannot act on is refused rather than
+  ignored. A channel argument in the `grpc.` namespace that is not in
+  `ChannelArgs::HONOURED` raises `ArgumentError`, and so does a target
+  scheme outside `dns`, `ipv4`, `ipv6` and `unix`. Names outside the
+  `grpc.` namespace are still ignored, which is what the C extension did
+  with them, and `channel_spec.rb` pins that. The alternative was a
+  keepalive setting that reads as configured and sends no PING.
+- There is no keepalive, so `grpc.keepalive_time_ms` is rejected by the
+  rule above. A half-open connection is noticed when a read fails.
 - There is no retry policy, no service config, no load balancing beyond
   one connection per channel, and no name resolution beyond DNS through
-  the resolver of the host.
+  the resolver of the host. Their channel arguments are rejected.
 - XDS credentials fall back to their wrapped credentials. There is no
-  xDS control plane client.
+  xDS control plane client, and `xds:///` is rejected as a target rather
+  than parsed as the host `xds`.
+- Health checking implements `Check`. There is no `Watch`, no server
+  reflection and no channelz.
 - `GRPC::Core::CompressionOptions` is honoured for channel arguments.
   A server does not compress a response unless the client asked for an
   algorithm.
