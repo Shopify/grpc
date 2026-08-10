@@ -151,16 +151,25 @@ module Kantan
 
         def refill
           if @pos == @buf.bytesize
-            # Nothing is pending, so the buffer's storage can be reused whole.
-            # It is emptied first because the invariant this relies on is that
-            # a failed refill leaves nothing readable: otherwise the bytes just
-            # consumed stay visible and the next caller parses them again as a
-            # frame. IO#readpartial also empties the buffer before it raises,
-            # so this is belt and braces, but it keeps the guarantee local
-            # rather than borrowed. #clear keeps the capacity.
-            @buf.clear
+            # Nothing is pending, so the buffer's storage can be reused whole:
+            # IO#readpartial overwrites it and keeps the allocation it already
+            # has.
             @pos = 0
-            @io.readpartial(CHUNK, @buf)
+            begin
+              @io.readpartial(CHUNK, @buf)
+            rescue IOError
+              # The invariant this relies on is that a failed refill leaves
+              # nothing readable, or the bytes just consumed stay visible and
+              # the next caller parses them again as a frame. IO#readpartial
+              # empties the buffer before EOFError but not before a closed
+              # stream error, so it is emptied here instead.
+              #
+              # #clear frees the buffer's storage rather than keeping it, so
+              # doing this on every read cost a 64 KiB allocation per frame
+              # read. Here it runs once, as the connection dies.
+              @buf.clear
+              raise
+            end
           else
             # A frame straddles the end of the buffer. Drop what was already
             # consumed, then append, so the buffer cannot grow without bound.
