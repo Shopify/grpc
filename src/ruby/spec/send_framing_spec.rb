@@ -27,10 +27,10 @@ class FramingCapturingSession
     @sent = []
   end
 
-  def send_data(_id, data, end_stream: false, ack: nil)
+  def send_data(_id, data, end_stream: false, ack_to: nil, ack_size: 0)
     _ = end_stream
     @sent << data
-    ack&.call
+    ack_to&.ack_write(ack_size)
   end
 end
 

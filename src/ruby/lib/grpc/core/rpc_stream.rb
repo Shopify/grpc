@@ -285,17 +285,22 @@ module GRPC
       # shapes and fail late on the other.
       def queue_write(frame, size)
         @write_mu.synchronize { @queued_bytes += size }
-        ack = lambda do
-          @write_mu.synchronize do
-            @queued_bytes -= size
-            @write_cv.broadcast
-          end
-        end
-        @connection.session.send_data(@id, frame, ack: ack)
+        @connection.session.send_data(@id, frame, ack_to: self, ack_size: size)
         @write_mu.synchronize do
           # The bounded wait keeps a lost acknowledgement from wedging the
           # caller; the transport fires every pending ack when it shuts down.
           @write_cv.wait(@write_mu, 1) while @queued_bytes > WRITE_HIGH_WATER
+        end
+      end
+
+      # Called from the write thread once +size+ bytes of this stream have
+      # left the body queue for the write buffer. This is the receiver the
+      # queue holds instead of a closure, so a client that streams does not
+      # allocate a lambda for every message it sends.
+      def ack_write(size)
+        @write_mu.synchronize do
+          @queued_bytes -= size
+          @write_cv.broadcast
         end
       end
 

@@ -322,8 +322,10 @@ module Kantan
       # +data+ becomes the transport's to write after this returns, so the
       # caller must not keep hold of it. RpcStream#send_message copies for
       # exactly that reason.
-      def send_data stream_id, data, end_stream: false, ack: nil
-        @write_queue << [:grpc_data, stream_id, data, end_stream, ack]
+      def send_data stream_id, data, end_stream: false, ack_to: nil,
+                    ack_size: 0
+        @write_queue << [:grpc_data, stream_id, data, end_stream, ack_to,
+                         ack_size]
       end
 
       # grpc: writes the trailing HEADERS block once queued DATA has drained.
@@ -530,15 +532,15 @@ module Kantan
             flush_pending wbuf
 
           when :grpc_data
-            _, stream_id, data, end_stream, ack = cmd
+            _, stream_id, data, end_stream, ack_to, ack_size = cmd
             stream = @streams[stream_id]
             unless stream
-              ack&.call
+              ack_to&.ack_write(ack_size)
               next
             end
 
             body = body_for(stream)
-            body.push_data data, ack
+            body.push_data data, ack_to, ack_size
             @pending_body_size += data.bytesize
             body.end! if end_stream
             flush_pending wbuf
@@ -685,7 +687,7 @@ module Kantan
       def drain_write_queue
         until @write_queue.empty?
           cmd = @write_queue.pop(true)
-          cmd[4]&.call if cmd[0] == :grpc_data
+          cmd[4]&.ack_write(cmd[5]) if cmd[0] == :grpc_data
         end
       rescue ThreadError
         nil

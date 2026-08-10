@@ -124,21 +124,31 @@ module Kantan
           @terminated = false
         end
 
-        # +ack+, when given, is called once every byte of +part+ has been
+        # +ack_to+, when given, is told once every byte of +part+ has been
         # taken out of this queue and into the transport's write buffer, which
         # is how gRPC applies write backpressure. That is one step short of
         # the socket, and it is the right point: the bytes are no longer this
         # queue's to hold.
-        def push_part part, ack = nil
-          @parts << [part, ack]
+        #
+        # A receiver and a size rather than a closure. The entry this pushes
+        # has to be allocated either way, so carrying the two values in it
+        # costs nothing, where a lambda per message did not.
+        def push_part part, ack_to = nil, ack_size = 0
+          @parts << [part, ack_to, ack_size, 0]
           @size += part.bytesize
         end
 
-        def push_data string, ack = nil
+        # A String is held directly, with its read offset in the entry, rather
+        # than wrapped in a Buffer. The entry has to exist either way, so the
+        # offset rides along for nothing, where the wrapper was an object per
+        # message. Other part kinds, such as Body::File, still answer
+        # #read_into themselves.
+        def push_data string, ack_to = nil, ack_size = 0
           if string.empty?
-            ack&.call
+            ack_to&.ack_write(ack_size)
           else
-            push_part Buffer.new(string), ack
+            @parts << [string, ack_to, ack_size, 0]
+            @size += string.bytesize
           end
         end
 
@@ -173,15 +183,36 @@ module Kantan
         def read_into buf, n
           taken = 0
           while taken < n && (entry = @parts.first)
-            part, ack = entry
-            taken += part.read_into(buf, n - taken)
-            next unless part.empty?
-            part.close
+            part = entry[0]
+            if part.is_a?(String)
+              taken += take_string(entry, buf, n - taken)
+              next unless entry[3] >= part.bytesize
+            else
+              taken += part.read_into(buf, n - taken)
+              next unless part.empty?
+              part.close
+            end
             @parts.shift
-            ack&.call
+            entry[1]&.ack_write(entry[2])
           end
           @size -= taken
           taken
+        end
+
+        # Appends up to +want+ bytes of the entry's String, from where the
+        # last call left off, and records the new offset in the entry.
+        def take_string entry, buf, want
+          string = entry[0]
+          offset = entry[3]
+          available = string.bytesize - offset
+          want = available if want > available
+          if offset.zero? && want == string.bytesize
+            Body.append_bytes(buf, string)
+          else
+            Body.append_slice(buf, string, offset, want)
+          end
+          entry[3] = offset + want
+          want
         end
 
         def bytesize
@@ -193,9 +224,9 @@ module Kantan
         end
 
         def close
-          @parts.each do |part, ack|
-            part.close
-            ack&.call
+          @parts.each do |part, ack_to, ack_size, _offset|
+            part.close unless part.is_a?(String)
+            ack_to&.ack_write(ack_size)
           end
           @parts.clear
           @size = 0
