@@ -20,6 +20,8 @@ require_relative 'channel_args'
 require_relative 'connection'
 require_relative 'constants'
 require_relative 'credentials'
+require_relative 'lb_policy'
+require_relative 'subchannel'
 require_relative 'transport'
 
 module GRPC
@@ -38,6 +40,12 @@ module GRPC
       # Minimum gap between connection attempts, so a hard-down target cannot
       # spin the reconnect loop.
       RECONNECT_BACKOFF = 0.05
+
+      # How often #await_connection re-checks after a wait, bounding the
+      # cost of a missed wakeup instead of trying to eliminate it: waking
+      # this often is cheap next to a connection attempt, and it lets the
+      # lock stay released while #maybe_start_connect pokes a Subchannel.
+      AWAIT_POLL_INTERVAL = 0.02
 
       # Every live channel, weakly held, so that GRPC.postfork_child can drop
       # the transports a child process inherited but cannot drive.
@@ -75,14 +83,25 @@ module GRPC
         @keepalive_permit_without_calls = !ChannelArgs.int(
           @args, ChannelArgs::KEEPALIVE_PERMIT_WITHOUT_CALLS, 0
         ).zero?
-        @client_idle_timeout =
-          ChannelArgs.seconds(@args, ChannelArgs::CLIENT_IDLE_TIMEOUT_MS)
+        @lb_policy_name = ChannelArgs.str(@args, ChannelArgs::LB_POLICY_NAME, 'pick_first')
+        unless LB_POLICIES.key?(@lb_policy_name)
+          fail ArgumentError,
+               "unsupported grpc.lb_policy_name #{@lb_policy_name.inspect}; " \
+               "this implementation supports #{LB_POLICIES.keys.join(', ')}"
+        end
+        @client_idle_timeout = ChannelArgs.seconds(@args, ChannelArgs::CLIENT_IDLE_TIMEOUT_MS)
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @state = ConnectivityStates::IDLE
-        @connection = nil
-        @connect_thread = nil
-        @last_attempt = nil
+        # One Subchannel per resolved address, plus the policy that picks
+        # among them; nil until #maybe_start_connect resolves the target
+        # for the first time, and again after every address has failed and
+        # #schedule_reresolve_locked has torn the stale set down.
+        @subchannels = nil
+        @lb_policy = nil
+        @resolving = false
+        @resolve_thread = nil
+        @idle_timer = nil
         @last_error = nil
         @destroyed = false
         LIVE[self] = true
@@ -121,10 +140,8 @@ module GRPC
       # rubocop:disable Style/OptionalBooleanParameter -- C API signature
       def connectivity_state(try_to_connect = false)
         fail 'closed!' if @destroyed
-        @mu.synchronize do
-          maybe_start_connect_locked if try_to_connect && connectable_locked?
-          @state
-        end
+        maybe_start_connect if try_to_connect
+        @mu.synchronize { @state }
       end
       # rubocop:enable Style/OptionalBooleanParameter
 
@@ -155,16 +172,17 @@ module GRPC
       end
 
       def destroy
-        connection = nil
+        subchannels = nil
         @mu.synchronize do
           return nil if @destroyed
           @destroyed = true
-          connection = @connection
-          @connection = nil
+          subchannels = @subchannels
+          @subchannels = nil
+          @lb_policy = nil
           @state = ConnectivityStates::FATAL_FAILURE
           @cv.broadcast
         end
-        connection&.close
+        subchannels&.each(&:close)
         nil
       end
       alias close destroy
@@ -183,16 +201,17 @@ module GRPC
       #
       # @api private
       def reset_after_fork!
-        connection = @connection
+        subchannels = @subchannels
         @mu = Mutex.new
         @cv = ConditionVariable.new
-        @connection = nil
-        @connect_thread = nil
+        @subchannels = nil
+        @lb_policy = nil
+        @resolving = false
+        @resolve_thread = nil
         @idle_timer = nil
-        @last_attempt = nil
         @last_error = nil
         @state = ConnectivityStates::IDLE unless @destroyed
-        connection&.abandon
+        subchannels&.each(&:abandon)
         nil
       end
 
@@ -229,68 +248,76 @@ module GRPC
         RpcStream.now + seconds
       end
 
-      # An IDLE channel connects immediately, as C-core does. The backoff only
-      # throttles retries after a failure.
-      def connectable_locked?
-        return false if @connection&.alive?
-        case @state
-        when ConnectivityStates::IDLE
-          true
-        when ConnectivityStates::TRANSIENT_FAILURE
-          @last_attempt.nil? ||
-            (RpcStream.now - @last_attempt) >= RECONNECT_BACKOFF
-        else
-          false
-        end
-      end
-
-      def maybe_start_connect_locked
-        return if @connect_thread
-        @last_attempt = RpcStream.now
-        transition_locked(ConnectivityStates::CONNECTING)
-        @connect_thread = Thread.new { connect_worker }
-        @connect_thread.name = 'grpc-connect'
-      end
-
-      def connect_worker
-        connection = build_connection
-        @mu.synchronize do
-          @connect_thread = nil
-          if @destroyed
-            connection.close
-          else
-            @connection = connection
-            @last_error = nil
-            transition_locked(ConnectivityStates::READY)
+      # An IDLE channel connects immediately, as C-core does; the reconnect
+      # backoff only throttles re-resolving after every address has failed
+      # (see #schedule_reresolve_locked). Safe to call without holding
+      # +@mu+: it takes the lock itself, in short, non-nested sections, so
+      # that poking a Subchannel never happens while this channel's own
+      # mutex is held -- a Subchannel may report a transition straight back
+      # into #on_subchannel_state_changed, which would deadlock on a
+      # recursive lock otherwise.
+      def maybe_start_connect
+        policy = @mu.synchronize do
+          if @subchannels.nil?
+            start_resolve_locked
+            next nil
           end
+          @lb_policy
         end
+        return if policy.nil?
+        policy.maybe_connect
+        @mu.synchronize { transition_locked(policy.connectivity_state) unless @destroyed }
+      end
+
+      def start_resolve_locked
+        return if @resolving
+        @resolving = true
+        transition_locked(ConnectivityStates::CONNECTING)
+        @resolve_thread = Thread.new { resolve_worker }
+        @resolve_thread.name = 'grpc-resolve'
+      end
+
+      # Runs the DNS lookup off the lock, exactly as dialing a socket always
+      # has, since a slow resolver must not stall every other channel
+      # operation.
+      def resolve_worker
+        addresses = Transport.resolve_addresses(@parsed_target)
+        policy = @mu.synchronize do
+          @resolving = false
+          next nil if @destroyed
+          build_subchannels_locked(addresses)
+          @lb_policy
+        end
+        policy&.maybe_connect
+        @mu.synchronize { transition_locked(policy.connectivity_state) unless @destroyed || policy.nil? }
       rescue StandardError => e
         @mu.synchronize do
-          @connect_thread = nil
+          @resolving = false
+          next if @destroyed
           @last_error = e
           transition_locked(ConnectivityStates::TRANSIENT_FAILURE)
-          schedule_idle_locked
+          schedule_reresolve_locked
         end
       end
 
-      # Returns to IDLE once the backoff expires, so that watchers wake up and
-      # the next attempt is allowed.
-      def schedule_idle_locked
-        return if @idle_timer
-        @idle_timer = Thread.new do
-          sleep RECONNECT_BACKOFF
-          @mu.synchronize do
-            @idle_timer = nil
-            next if @destroyed
-            next unless @state == ConnectivityStates::TRANSIENT_FAILURE
-            transition_locked(ConnectivityStates::IDLE)
-          end
-        end
+      def build_subchannels_locked(addresses)
+        @subchannels = addresses.map { |address| new_subchannel(address) }
+        @lb_policy = LB_POLICIES.fetch(@lb_policy_name).new(@subchannels)
       end
 
-      def build_connection
+      def new_subchannel(address)
+        Subchannel.new(address, dial: method(:build_connection_for),
+                                on_state_change: method(:on_subchannel_state_changed))
+      end
+
+      # Dials +address+, one of the addresses #resolve_addresses returned
+      # for @parsed_target. TLS hostname verification and any HTTP CONNECT
+      # proxy authority still use @parsed_target -- the name the caller
+      # asked for -- never the resolved address.
+      def build_connection_for(address, on_close)
         socket, peer, peer_cert = Transport.connect(
-          @parsed_target, @credentials, ssl_target_override)
+          @parsed_target, @credentials, ssl_target_override,
+          address: address, args: @args)
         connection = Connection.new(
           socket, peer: peer, client: true, peer_cert: peer_cert,
                   max_receive_message_length: @max_receive_message_length,
@@ -299,7 +326,7 @@ module GRPC
                   keepalive_timeout: @keepalive_timeout,
                   keepalive_permit_without_calls: @keepalive_permit_without_calls,
                   client_idle_timeout: @client_idle_timeout,
-                  on_close: method(:on_connection_closed))
+                  on_close: on_close)
         connection.start
         # A completed TCP connect is not a usable channel: the peer may have
         # queued the socket and never serviced it. READY means the HTTP/2
@@ -313,12 +340,47 @@ module GRPC
         connection
       end
 
-      def on_connection_closed(connection)
+      # Called by a Subchannel, outside its own lock, after a transition it
+      # reported asynchronously (never while this channel's own lock is
+      # held -- see #maybe_start_connect). Recomputes the aggregate: READY
+      # if any subchannel is, CONNECTING if any is, TRANSIENT_FAILURE only
+      # once every one has failed. A nil @lb_policy means this channel has
+      # already re-resolved past the subchannel reporting in; ignore it.
+      def on_subchannel_state_changed(_subchannel)
         @mu.synchronize do
-          next unless @connection.equal?(connection)
-          @connection = nil
-          transition_locked(ConnectivityStates::IDLE) unless @destroyed
+          next if @destroyed || @lb_policy.nil?
+          new_state = @lb_policy.connectivity_state
+          if new_state == ConnectivityStates::TRANSIENT_FAILURE
+            @last_error = @lb_policy.last_error
+            schedule_reresolve_locked
+          end
+          transition_locked(new_state)
         end
+      end
+
+      # Every resolved address has failed. Reuses RECONNECT_BACKOFF -- the
+      # same gap a single connection attempt always waited out after a
+      # failure -- rather than inventing a second backoff scheme, then
+      # re-resolves so a DNS change, or an address that is reachable again,
+      # gets picked up. Subchannels are closed after the lock is released,
+      # since #close reports back through #on_subchannel_state_changed.
+      def schedule_reresolve_locked
+        return if @idle_timer
+        @idle_timer = Thread.new do
+          sleep RECONNECT_BACKOFF
+          subchannels = @mu.synchronize do
+            @idle_timer = nil
+            next nil if @destroyed
+            next nil unless @lb_policy.connectivity_state == ConnectivityStates::TRANSIENT_FAILURE
+            stale = @subchannels
+            @subchannels = nil
+            @lb_policy = nil
+            transition_locked(ConnectivityStates::IDLE)
+            stale
+          end
+          subchannels&.each(&:close)
+        end
+        @idle_timer.name = 'grpc-reresolve'
       end
 
       def transition_locked(state)
@@ -331,23 +393,27 @@ module GRPC
       # the attempt fails so that Call can turn it into an UNAVAILABLE status.
       def await_connection(deadline)
         limit = deadline || (RpcStream.now + Transport::DEFAULT_CONNECT_TIMEOUT)
-        @mu.synchronize do
-          loop do
-            fail Connection::Closed, 'channel closed' if @destroyed
-            return @connection if @connection&.alive?
-            if @state == ConnectivityStates::TRANSIENT_FAILURE && @last_error
-              error = @last_error
-              @last_error = nil
-              raise error
-            end
-            maybe_start_connect_locked if connectable_locked?
-            remaining = limit - RpcStream.now
-            if remaining <= 0
-              fail Connection::Closed, "connect timed out to #{@target}"
-            end
-            @cv.wait(@mu, remaining)
-          end
+        loop do
+          kind, value = @mu.synchronize { pick_or_error_locked }
+          return value.connection if kind == :ready
+          raise value if kind == :error
+          maybe_start_connect
+          remaining = limit - RpcStream.now
+          fail Connection::Closed, "connect timed out to #{@target}" if remaining <= 0
+          @mu.synchronize { @cv.wait(@mu, [remaining, AWAIT_POLL_INTERVAL].min) }
         end
+      end
+
+      # Must be called with @mu held. Returns the subchannel to use, the error
+      # to raise, or nothing when the caller should wait and look again.
+      def pick_or_error_locked
+        fail Connection::Closed, 'channel closed' if @destroyed
+        subchannel = @lb_policy&.pick
+        return [:ready, subchannel] if subchannel
+        return nil unless @state == ConnectivityStates::TRANSIENT_FAILURE && @last_error
+        error = @last_error
+        @last_error = nil
+        [:error, error]
       end
     end
   end

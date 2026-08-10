@@ -38,6 +38,8 @@ module GRPC
       MAX_CONNECTION_AGE_MS = 'grpc.max_connection_age_ms'
       MAX_CONNECTION_AGE_GRACE_MS = 'grpc.max_connection_age_grace_ms'
       MAX_METADATA_SIZE = 'grpc.max_metadata_size'
+      LB_POLICY_NAME = 'grpc.lb_policy_name'
+      ENABLE_HTTP_PROXY = 'grpc.enable_http_proxy'
       COMPRESSION_ENABLED_ALGORITHMS_BITSET =
         'grpc.compression_enabled_algorithms_bitset'
       DEFAULT_COMPRESSION_ALGORITHM = 'grpc.default_compression_algorithm'
@@ -55,9 +57,11 @@ module GRPC
         DEFAULT_AUTHORITY,
         DEFAULT_COMPRESSION_ALGORITHM,
         DEFAULT_COMPRESSION_LEVEL,
+        ENABLE_HTTP_PROXY,
         KEEPALIVE_PERMIT_WITHOUT_CALLS,
         KEEPALIVE_TIME_MS,
         KEEPALIVE_TIMEOUT_MS,
+        LB_POLICY_NAME,
         MAX_CONCURRENT_STREAMS,
         MAX_CONNECTION_AGE_GRACE_MS,
         MAX_CONNECTION_AGE_MS,
