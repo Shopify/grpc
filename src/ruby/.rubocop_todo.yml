@@ -905,15 +905,23 @@ Style/ZeroLengthPredicate:
 Layout/LineLength:
   Max: 186
 
-# Offense count: 1
+# Offense count: 4
 # GRPC::Core::Call implements the whole run_batch operation surface, which the
-# C extension expressed in one file too.
+# C extension expressed in one file too. Channel, Connection and Server each
+# grew past the limit carrying the connection-management features the C
+# extension got from core: keepalive, connection lifetime limits, subchannels
+# and load balancing.
 Metrics/ClassLength:
   Exclude:
     - 'lib/grpc/core/call.rb'
+    - 'lib/grpc/core/channel.rb'
+    - 'lib/grpc/core/connection.rb'
+    - 'lib/grpc/core/server.rb'
 
-# Offense count: 1
+# Offense count: 2
 # GRPC::Core::Transport holds target parsing plus client and server TLS setup.
+# ChannelArgs is one constant per supported channel argument plus its readers.
 Metrics/ModuleLength:
   Exclude:
     - 'lib/grpc/core/transport.rb'
+    - 'lib/grpc/core/channel_args.rb'
