@@ -68,6 +68,9 @@ module GRPC
           ChannelArgs::DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH)
         @max_send_message_length = ChannelArgs.int(
           @args, ChannelArgs::MAX_SEND_MESSAGE_LENGTH, RpcStream::NO_LIMIT)
+        @max_metadata_size = ChannelArgs.int(
+          @args, ChannelArgs::MAX_METADATA_SIZE,
+          ChannelArgs::DEFAULT_MAX_METADATA_SIZE)
         @max_concurrent_streams = ChannelArgs.int(
           @args, ChannelArgs::MAX_CONCURRENT_STREAMS, 100)
         @so_reuseport = !ChannelArgs.int(@args, ChannelArgs::SO_REUSEPORT, 1).zero?
@@ -78,10 +81,8 @@ module GRPC
         @keepalive_permit_without_calls = !ChannelArgs.int(
           @args, ChannelArgs::KEEPALIVE_PERMIT_WITHOUT_CALLS, 0
         ).zero?
-        @max_connection_idle =
-          ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_IDLE_MS)
-        @max_connection_age =
-          ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_AGE_MS)
+        @max_connection_idle = ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_IDLE_MS)
+        @max_connection_age = ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_AGE_MS)
         @max_connection_age_grace =
           ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_AGE_GRACE_MS)
         @mu = Mutex.new
@@ -282,6 +283,10 @@ module GRPC
 
       # Runs on a connection reader thread; only queues work.
       def enqueue_rpc(stream, headers)
+        if oversized_metadata?(headers)
+          reject_oversized_metadata(stream, headers)
+          return
+        end
         method_path = header(headers, ':path')
         return if method_path.nil?
         deadline = deadline_from(header(headers, 'grpc-timeout'))
@@ -299,6 +304,32 @@ module GRPC
             @cv.broadcast
           end
         end
+      end
+
+      def oversized_metadata?(headers)
+        Metadata.size(headers) > @max_metadata_size
+      end
+
+      # The client has already sent its request by the time headers arrive,
+      # so the only way to fail an oversized one without leaving the peer to
+      # time out is to answer with a status. A single HEADERS frame carrying
+      # grpc-status, with no separate initial metadata, is exactly what
+      # RpcStream#trailers_only? on the client side already knows how to
+      # read as a trailers-only response. No Call exists yet for this
+      # stream, so it is dropped from the connection directly rather than
+      # through Call#close.
+      def reject_oversized_metadata(stream, headers)
+        size = Metadata.size(headers)
+        stream.send_headers(
+          [[':status', '200'], ['content-type', 'application/grpc'],
+           ['grpc-status', StatusCodes::RESOURCE_EXHAUSTED.to_s],
+           ['grpc-message',
+            "Received metadata size exceeds grpc.max_metadata_size " \
+            "(#{size} vs. #{@max_metadata_size})"]],
+          end_stream: true)
+        stream.connection.forget(stream.id)
+      rescue Http2::Kantan::Errors::Error, IOError, SystemCallError
+        nil
       end
 
       def header(headers, name)

@@ -37,6 +37,7 @@ module GRPC
       MAX_CONNECTION_IDLE_MS = 'grpc.max_connection_idle_ms'
       MAX_CONNECTION_AGE_MS = 'grpc.max_connection_age_ms'
       MAX_CONNECTION_AGE_GRACE_MS = 'grpc.max_connection_age_grace_ms'
+      MAX_METADATA_SIZE = 'grpc.max_metadata_size'
       COMPRESSION_ENABLED_ALGORITHMS_BITSET =
         'grpc.compression_enabled_algorithms_bitset'
       DEFAULT_COMPRESSION_ALGORITHM = 'grpc.default_compression_algorithm'
@@ -53,6 +54,7 @@ module GRPC
         COMPRESSION_ENABLED_ALGORITHMS_BITSET,
         DEFAULT_AUTHORITY,
         DEFAULT_COMPRESSION_ALGORITHM,
+        DEFAULT_COMPRESSION_LEVEL,
         KEEPALIVE_PERMIT_WITHOUT_CALLS,
         KEEPALIVE_TIME_MS,
         KEEPALIVE_TIMEOUT_MS,
@@ -60,6 +62,7 @@ module GRPC
         MAX_CONNECTION_AGE_GRACE_MS,
         MAX_CONNECTION_AGE_MS,
         MAX_CONNECTION_IDLE_MS,
+        MAX_METADATA_SIZE,
         MAX_RECEIVE_MESSAGE_LENGTH,
         MAX_SEND_MESSAGE_LENGTH,
         PRIMARY_USER_AGENT,
@@ -73,6 +76,9 @@ module GRPC
       # gRPC's own default for both directions is 4 MiB receive, unlimited
       # send; -1 means "no limit".
       DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH = 4 * 1024 * 1024
+
+      # gRPC's own default cap on received metadata.
+      DEFAULT_MAX_METADATA_SIZE = 8 * 1024
 
       module_function
 
@@ -107,16 +113,40 @@ module GRPC
 
       # Maps grpc.default_compression_algorithm, an integer from the
       # grpc_compression_algorithm enum, to the name the transport uses.
-      # Returns nil when the enabled bitset excludes that algorithm.
+      # Returns nil when the enabled bitset excludes that algorithm. An
+      # explicit algorithm always wins over grpc.default_compression_level:
+      # only when the caller named none does the level get a say.
       def compression_algorithm(args)
         value = args[DEFAULT_COMPRESSION_ALGORITHM]
-        return nil unless value.is_a?(Integer)
+        return algorithm_from_value(args, value) if value.is_a?(Integer)
+        algorithm_from_level(args)
+      end
+
+      def algorithm_from_value(args, value)
         name = CompressionOptions::ALGORITHM_NAMES[value]
         return nil if name.nil? || name == :identity
+        return nil unless algorithm_enabled?(args, value)
+        name.to_s
+      end
+
+      # grpc.default_compression_level picks an algorithm only when nothing
+      # was named explicitly. This core only ever compresses with gzip, so
+      # every level above none maps to gzip when it is enabled, and none
+      # maps to identity, exactly as C-core's level-to-algorithm table does
+      # once a transport with a single non-identity algorithm is in play.
+      def algorithm_from_level(args)
+        level = args[DEFAULT_COMPRESSION_LEVEL]
+        return nil unless level.is_a?(Integer) &&
+                          level != CompressionOptions::LEVEL_VALUES[:none]
+        gzip = CompressionOptions::ALGORITHM_VALUES[:gzip]
+        return nil unless algorithm_enabled?(args, gzip)
+        'gzip'
+      end
+
+      def algorithm_enabled?(args, value)
         bitset = int(args, COMPRESSION_ENABLED_ALGORITHMS_BITSET,
                      CompressionOptions::DEFAULT_ENABLED_ALGORITHMS_BITSET)
-        return nil if (bitset & (1 << value)).zero?
-        name.to_s
+        !(bitset & (1 << value)).zero?
       end
 
       def normalize_key(key)

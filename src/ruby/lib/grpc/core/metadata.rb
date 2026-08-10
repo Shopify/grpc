@@ -117,6 +117,36 @@ module GRPC
       rescue ArgumentError
         value
       end
+
+      # Fixed per-pair overhead grpc.max_metadata_size charges in addition to
+      # the name and value bytes, matching what grpc_metadata_batch adds so a
+      # handful of short pairs cannot dodge a limit a single long one would
+      # hit.
+      PAIR_OVERHEAD = 32
+
+      # @param pairs [Array<Array(String, String)>]
+      # @return [Integer] the size gRPC counts against grpc.max_metadata_size
+      def size(pairs)
+        pairs.sum { |name, value| name.bytesize + value.bytesize + PAIR_OVERHEAD }
+      end
+
+      # Fails with ResourceExhausted when +pairs+ is heavier than +max+,
+      # matching the RESOURCE_EXHAUSTED status gRPC gives a peer whose
+      # headers overflow grpc.max_metadata_size. Only ever applied to
+      # received metadata: the limit protects a peer from what it is handed,
+      # not from what it chooses to send. +max+ of nil means unlimited.
+      def check_size!(pairs, max)
+        return if max.nil?
+        total = size(pairs)
+        return if total <= max
+        fail ResourceExhausted,
+             "Received metadata size exceeds peer limit " \
+             "grpc.max_metadata_size (#{total} vs. #{max})"
+      end
+
+      # Raised by #check_size! when received metadata is heavier than
+      # grpc.max_metadata_size.
+      class ResourceExhausted < StandardError; end
     end
   end
 end

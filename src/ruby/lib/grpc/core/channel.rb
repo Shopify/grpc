@@ -51,7 +51,8 @@ module GRPC
         nil
       end
 
-      attr_reader :target, :call_credentials, :default_compression_algorithm
+      attr_reader :target, :call_credentials, :default_compression_algorithm,
+                  :max_metadata_size
 
       def initialize(target, channel_args, credentials)
         @target = target
@@ -64,6 +65,9 @@ module GRPC
         @max_send_message_length = ChannelArgs.int(
           @args, ChannelArgs::MAX_SEND_MESSAGE_LENGTH, RpcStream::NO_LIMIT)
         @default_compression_algorithm = ChannelArgs.compression_algorithm(@args)
+        @max_metadata_size = ChannelArgs.int(
+          @args, ChannelArgs::MAX_METADATA_SIZE,
+          ChannelArgs::DEFAULT_MAX_METADATA_SIZE)
         @keepalive_time = ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIME_MS)
         @keepalive_timeout =
           ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIMEOUT_MS) ||

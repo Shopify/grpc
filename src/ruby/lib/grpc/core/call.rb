@@ -363,13 +363,28 @@ module GRPC
         end
         pairs = @stream.await_headers(@monotonic_deadline)
         @initial_metadata_received = true
-        result.metadata =
-          if pairs.nil?
-            {}
-          else
-            Metadata.decode(
-              pairs.reject { |n, _| Metadata::CLIENT_RESERVED.include?(n) })
-          end
+        if pairs.nil?
+          result.metadata = {}
+          return
+        end
+        check_received_metadata_size!(pairs)
+        result.metadata = Metadata.decode(
+          pairs.reject { |n, _| Metadata::CLIENT_RESERVED.include?(n) })
+      rescue Metadata::ResourceExhausted => e
+        record_status(StatusCodes::RESOURCE_EXHAUSTED, e.message)
+        result.metadata = {}
+      end
+
+      # Applied to metadata this side received, matching gRPC's own
+      # grpc.max_metadata_size, which protects a peer from what it is
+      # handed rather than from what it chooses to send.
+      #
+      # A server-side call has no channel: the server checks the request
+      # headers itself, before a Call exists, so there is no limit to apply
+      # here.
+      def check_received_metadata_size!(pairs)
+        return if @channel.nil?
+        Metadata.check_size!(pairs, @channel.max_metadata_size)
       end
 
       def op_recv_message(result)
@@ -560,6 +575,7 @@ module GRPC
       end
 
       def status_from_trailers(pairs)
+        check_received_metadata_size!(pairs)
         code = lookup(pairs, 'grpc-status')
         if code.nil?
           return with_debug(Struct::Status.new(
@@ -571,6 +587,9 @@ module GRPC
         with_debug(Struct::Status.new(code.to_i,
                                       details ? percent_decode(details) : '',
                                       metadata, nil))
+      rescue Metadata::ResourceExhausted => e
+        with_debug(Struct::Status.new(StatusCodes::RESOURCE_EXHAUSTED,
+                                      e.message, {}, nil))
       end
 
       # C-core attaches a JSON diagnostic blob to every failed RPC; the Ruby
