@@ -65,16 +65,21 @@ module GRPC
 
       EMPTY = ''.b.freeze
 
+      # grpc.max_send_message_length is unlimited by default, as it is in gRPC.
+      NO_LIMIT = -1
+
       # A transport failure translated into a gRPC status.
       Failure = Struct.new(:code, :details)
 
       attr_reader :id, :connection
       attr_accessor :peer, :peer_cert, :recv_encoding, :send_encoding
 
-      def initialize(connection, id, max_receive_message_length:)
+      def initialize(connection, id, max_receive_message_length:,
+                     max_send_message_length: NO_LIMIT)
         @connection = connection
         @id = id
         @max_receive_message_length = max_receive_message_length
+        @max_send_message_length = max_send_message_length
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @headers = nil
@@ -238,7 +243,16 @@ module GRPC
         return +''.b if length.zero?
         body = read_bytes(length, deadline)
         fail Truncated, 'truncated gRPC message' if body.nil?
-        compressed ? MessageCompression.decompress(@recv_encoding, body) : body
+        return body unless compressed
+        # The peer chose an encoding. gRPC requires UNIMPLEMENTED when it is
+        # not one we support, and the body is read first so the stream stays
+        # in step with the frame the peer sent.
+        unless MessageCompression.supported?(@recv_encoding)
+          fail UnsupportedEncoding,
+               "Unsupported message encoding #{@recv_encoding.inspect}; " \
+               "supported: #{MessageCompression::SUPPORTED.join(', ')}"
+        end
+        MessageCompression.decompress(@recv_encoding, body)
       end
 
       # ---- outbound ---------------------------------------------------------
@@ -264,6 +278,14 @@ module GRPC
       # prefix is fixed at this moment while the bytes were not, a payload
       # that changed size desynchronised the stream and killed the RPC.
       def send_message(payload, no_compress: false)
+        # The limit is on the message the caller handed over, before this
+        # compresses it, which is the size they can act on.
+        if @max_send_message_length.positive? &&
+           payload.bytesize > @max_send_message_length
+          fail ResourceExhausted,
+               "Sent message larger than max (#{payload.bytesize} vs. " \
+               "#{@max_send_message_length})"
+        end
         flag = 0
         if !no_compress && @send_encoding != 'identity'
           payload = MessageCompression.compress(@send_encoding, payload)
@@ -349,6 +371,9 @@ module GRPC
       class Truncated < StandardError; end
       # Raised when a message exceeds grpc.max_receive_message_length.
       class ResourceExhausted < StandardError; end
+      # Raised when the peer compressed a message with an algorithm this
+      # implementation does not support.
+      class UnsupportedEncoding < StandardError; end
 
       private
 

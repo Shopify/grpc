@@ -50,6 +50,7 @@ module GRPC
 
       # rubocop:disable Metrics/ParameterLists -- all but +io+ are keywords
       def initialize(io, peer:, client:, max_receive_message_length:,
+                     max_send_message_length: RpcStream::NO_LIMIT,
                      max_concurrent_streams: 100, peer_cert: nil,
                      on_new_rpc: nil, on_close: nil)
         super()
@@ -58,6 +59,7 @@ module GRPC
         @peer_cert = peer_cert
         @client = client
         @max_receive_message_length = max_receive_message_length
+        @max_send_message_length = max_send_message_length
         @on_new_rpc = on_new_rpc
         @on_close = on_close
         @streams = {}
@@ -229,7 +231,9 @@ module GRPC
 
       def new_stream(id)
         stream = RpcStream.new(
-          self, id, max_receive_message_length: @max_receive_message_length)
+          self, id,
+          max_receive_message_length: @max_receive_message_length,
+          max_send_message_length: @max_send_message_length)
         stream.peer = @peer
         stream.peer_cert = @peer_cert
         stream

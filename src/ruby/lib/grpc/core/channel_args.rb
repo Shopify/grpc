@@ -79,6 +79,20 @@ module GRPC
         end
       end
 
+      # Maps grpc.default_compression_algorithm, an integer from the
+      # grpc_compression_algorithm enum, to the name the transport uses.
+      # Returns nil when the enabled bitset excludes that algorithm.
+      def compression_algorithm(args)
+        value = args[DEFAULT_COMPRESSION_ALGORITHM]
+        return nil unless value.is_a?(Integer)
+        name = CompressionOptions::ALGORITHM_NAMES[value]
+        return nil if name.nil? || name == :identity
+        bitset = int(args, COMPRESSION_ENABLED_ALGORITHMS_BITSET,
+                     CompressionOptions::DEFAULT_ENABLED_ALGORITHMS_BITSET)
+        return nil if (bitset & (1 << value)).zero?
+        name.to_s
+      end
+
       # Reads an integer argument, falling back to +default+.
       def int(args, key, default)
         value = args[key]

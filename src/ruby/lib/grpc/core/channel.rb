@@ -51,7 +51,7 @@ module GRPC
         nil
       end
 
-      attr_reader :target, :call_credentials
+      attr_reader :target, :call_credentials, :default_compression_algorithm
 
       def initialize(target, channel_args, credentials)
         @target = target
@@ -61,6 +61,9 @@ module GRPC
         @max_receive_message_length = ChannelArgs.int(
           @args, ChannelArgs::MAX_RECEIVE_MESSAGE_LENGTH,
           ChannelArgs::DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH)
+        @max_send_message_length = ChannelArgs.int(
+          @args, ChannelArgs::MAX_SEND_MESSAGE_LENGTH, RpcStream::NO_LIMIT)
+        @default_compression_algorithm = ChannelArgs.compression_algorithm(@args)
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @state = ConnectivityStates::IDLE
@@ -278,6 +281,7 @@ module GRPC
         connection = Connection.new(
           socket, peer: peer, client: true, peer_cert: peer_cert,
                   max_receive_message_length: @max_receive_message_length,
+                  max_send_message_length: @max_send_message_length,
                   on_close: method(:on_connection_closed))
         connection.start
         # A completed TCP connect is not a usable channel: the peer may have

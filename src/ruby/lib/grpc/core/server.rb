@@ -66,6 +66,8 @@ module GRPC
         @max_receive_message_length = ChannelArgs.int(
           @args, ChannelArgs::MAX_RECEIVE_MESSAGE_LENGTH,
           ChannelArgs::DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH)
+        @max_send_message_length = ChannelArgs.int(
+          @args, ChannelArgs::MAX_SEND_MESSAGE_LENGTH, RpcStream::NO_LIMIT)
         @max_concurrent_streams = ChannelArgs.int(
           @args, ChannelArgs::MAX_CONCURRENT_STREAMS, 100)
         @so_reuseport = !ChannelArgs.int(@args, ChannelArgs::SO_REUSEPORT, 1).zero?
@@ -219,6 +221,7 @@ module GRPC
         connection = Connection.new(
           socket, peer: peer, client: false, peer_cert: peer_cert,
                   max_receive_message_length: @max_receive_message_length,
+                  max_send_message_length: @max_send_message_length,
                   max_concurrent_streams: @max_concurrent_streams,
                   on_new_rpc: method(:enqueue_rpc),
                   on_close: method(:forget_connection))

@@ -316,6 +316,8 @@ module GRPC
         no_compress = !@write_flag.nil? &&
                       (@write_flag & WriteFlags::NO_COMPRESS) != 0
         @stream.send_message(value, no_compress: no_compress)
+      rescue RpcStream::ResourceExhausted => e
+        record_status(StatusCodes::RESOURCE_EXHAUSTED, e.message)
       rescue Http2::Kantan::Errors::Error, IOError, SystemCallError => e
         record_transport_failure(e)
       end
@@ -377,6 +379,9 @@ module GRPC
       rescue RpcStream::ResourceExhausted => e
         record_status(StatusCodes::RESOURCE_EXHAUSTED, e.message)
         result.message = nil
+      rescue RpcStream::UnsupportedEncoding => e
+        record_status(StatusCodes::UNIMPLEMENTED, e.message)
+        result.message = nil
       rescue RpcStream::Truncated, Http2::Kantan::Errors::Error, IOError,
              SystemCallError => e
         record_transport_failure(e)
@@ -402,7 +407,11 @@ module GRPC
       def start_client_call(metadata)
         @start_attempted = true
         md = metadata.nil? ? {} : metadata.dup
-        requested = md.delete(MetadataKeys::COMPRESSION_REQUEST_ALGORITHM)
+        # A per-call request wins; otherwise the channel's
+        # grpc.default_compression_algorithm applies, which is how
+        # CompressionOptions reaches a call.
+        requested = md.delete(MetadataKeys::COMPRESSION_REQUEST_ALGORITHM) ||
+                    @channel.default_compression_algorithm
         credential_headers = call_credentials_headers
         return if failed?
         # Metadata errors are the caller's fault and must surface as-is, so
@@ -601,6 +610,8 @@ module GRPC
         case error
         when RpcStream::ResourceExhausted
           [StatusCodes::RESOURCE_EXHAUSTED, error.message]
+        when RpcStream::UnsupportedEncoding
+          [StatusCodes::UNIMPLEMENTED, error.message]
         when OpenSSL::SSL::SSLError
           [StatusCodes::UNAVAILABLE, "Handshake failed: #{error.message}"]
         else
