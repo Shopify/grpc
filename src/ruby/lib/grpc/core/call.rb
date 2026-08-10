@@ -501,8 +501,12 @@ module GRPC
         return with_debug(cancelled) if cancelled
         return with_debug(@transport_failure) if @transport_failure
         pairs = @stream.await_trailers(@monotonic_deadline)
-        if @stream.failure
-          failure = @stream.failure
+        # A status the peer sent is authoritative. The connection dying just
+        # after it arrived does not undo it: the server finished the call, and
+        # a GOAWAY riding in the same segment as the trailers is the normal
+        # shape of a graceful shutdown. Only when no trailers reached us does
+        # the transport failure decide the outcome.
+        if pairs.empty? && (failure = @stream.failure)
           return with_debug(Struct::Status.new(failure.code, failure.details,
                                                {}, nil))
         end
