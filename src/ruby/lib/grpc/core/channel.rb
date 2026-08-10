@@ -21,6 +21,7 @@ require_relative 'connection'
 require_relative 'constants'
 require_relative 'credentials'
 require_relative 'lb_policy'
+require_relative 'service_config'
 require_relative 'subchannel'
 require_relative 'transport'
 
@@ -90,6 +91,8 @@ module GRPC
                "this implementation supports #{LB_POLICIES.keys.join(', ')}"
         end
         @client_idle_timeout = ChannelArgs.seconds(@args, ChannelArgs::CLIENT_IDLE_TIMEOUT_MS)
+        @service_config = build_service_config
+        @enable_retries_arg = @args[ChannelArgs::ENABLE_RETRIES]
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @state = ConnectivityStates::IDLE
@@ -171,6 +174,21 @@ module GRPC
                     deadline: deadline, parent: parent, mask: mask)
       end
 
+      # Returns the MethodConfig from the service config that applies to
+      # +method+ (e.g. "/pkg.Svc/Method"), or nil when there is no service
+      # config or nothing in it applies.
+      def method_config(method)
+        @service_config&.method_config(method)
+      end
+
+      # Whether retries are enabled for +method+. An explicit
+      # grpc.enable_retries wins; absent that, gRPC turns retries on
+      # exactly when the applicable method config carries a retry policy.
+      def retries_enabled?(method)
+        return @enable_retries_arg != 0 unless @enable_retries_arg.nil?
+        !method_config(method)&.retry_policy.nil?
+      end
+
       def destroy
         subchannels = nil
         @mu.synchronize do
@@ -216,6 +234,13 @@ module GRPC
       end
 
       private
+
+      # Malformed JSON in grpc.service_config must fail channel construction
+      # rather than silently run without the timeouts and retries it names.
+      def build_service_config
+        json = ChannelArgs.str(@args, ChannelArgs::SERVICE_CONFIG)
+        json.nil? ? nil : ServiceConfig.new(json)
+      end
 
       def resolve_credentials(credentials)
         case credentials

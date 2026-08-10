@@ -176,7 +176,14 @@ module GRPC
 
       handle_return_op(c, return_op, metadata, credentials, method) do
         execute_with_interceptors(:request_response, intercept_args, credentials, method, c) do |resolved_md|
-          c.request_response(req, metadata: resolved_md)
+          retry_policy = @ch.retries_enabled?(method) && retry_policy_for(method)
+          if retry_policy
+            request_response_with_retries(method, req, marshal, unmarshal, c,
+                                          resolved_md, retry_policy,
+                                          parent: parent, credentials: credentials)
+          else
+            c.request_response(req, metadata: resolved_md)
+          end
         end
       end
     end
@@ -455,7 +462,13 @@ module GRPC
                         deadline: nil,
                         parent: nil,
                         credentials: nil)
-      deadline = from_relative_time(@timeout) if deadline.nil?
+      if deadline.nil?
+        # The service config's timeout is the deadline the caller gets when
+        # it named none; @timeout (the stub-wide default) only applies when
+        # the service config says nothing about this method either.
+        default_timeout = @ch.method_config(method)&.timeout || @timeout
+        deadline = from_relative_time(default_timeout)
+      end
       # Provide each new client call with its own completion queue
       call = @ch.create_call(parent, # parent call
                              @propagate_mask, # propagation options
@@ -465,6 +478,82 @@ module GRPC
       call.set_credentials! credentials unless credentials.nil?
       ActiveCall.new(call, marshal, unmarshal, deadline,
                      started: false)
+    end
+
+    # Returns the retry policy that applies to +method+, or nil.
+    def retry_policy_for(method)
+      @ch.method_config(method)&.retry_policy
+    end
+
+    # Drives the retry loop for a unary call. +first_call+ has already sent
+    # nothing; each subsequent attempt gets a brand new ActiveCall (and thus
+    # a fresh Core::Call) sharing the one absolute deadline, since a Call is
+    # single-use once run_batch has touched it.
+    #
+    # A unary #request_response only ever returns after RECV_STATUS_ON_CLIENT
+    # has arrived alongside RECV_MESSAGE in the same batch, and raises before
+    # handing a message to the caller when the status is bad. That makes
+    # every attempt here uncommitted by construction: this method is never
+    # reached again once an attempt has returned a value to the caller.
+    def request_response_with_retries(method, req, marshal, unmarshal, first_call,
+                                      metadata, retry_policy, parent:, credentials:)
+      deadline = first_call.deadline
+      call = first_call
+      attempt = 1
+      begin
+        call.request_response(req, metadata: attempt_metadata(metadata, attempt))
+      rescue GRPC::BadStatus => e
+        backoff = attempt < retry_policy.max_attempts ? retry_backoff(e, retry_policy, attempt, deadline) : nil
+        raise e if backoff.nil?
+        sleep(backoff)
+        attempt += 1
+        call = new_active_call(method, marshal, unmarshal,
+                               deadline: deadline, parent: parent, credentials: credentials)
+        retry
+      end
+    end
+
+    # Adds grpc-previous-rpc-attempts from the second attempt on, as
+    # https://github.com/grpc/proposal/blob/master/A6-client-retries.md
+    # requires so the server can tell attempts apart.
+    def attempt_metadata(metadata, attempt)
+      return metadata if attempt == 1
+      metadata.merge('grpc-previous-rpc-attempts' => (attempt - 1).to_s)
+    end
+
+    # nil means "give up, raise the error that got us here": either the
+    # trailers said to (a negative grpc-retry-pushback-ms), the status isn't
+    # retryable and the server offered no pushback, or waiting for the next
+    # attempt would run past the call's own deadline.
+    def retry_backoff(bad_status, retry_policy, attempt, deadline)
+      pushback = retry_pushback_ms(bad_status.metadata)
+      return nil if pushback&.negative?
+      return nil if pushback.nil? && !retry_policy.retryable_status_codes.include?(bad_status.code)
+      backoff = pushback ? pushback / 1000.0 : exponential_backoff(retry_policy, attempt)
+      remaining = Core::TimeSpec.from(deadline).to_relative_seconds
+      return nil if remaining && remaining <= 0
+      remaining.nil? ? backoff : [backoff, remaining].min
+    end
+
+    # currentBackoff = min(initialBackoff * backoffMultiplier**(attempt - 1),
+    # maxBackoff), then a jittered wait uniformly random in [0, currentBackoff)
+    # so retrying clients spread out instead of hammering the server in
+    # lockstep, per the retry design's backoff formula.
+    def exponential_backoff(retry_policy, attempt)
+      current = retry_policy.initial_backoff *
+                (retry_policy.backoff_multiplier**(attempt - 1))
+      rand * [current, retry_policy.max_backoff].min
+    end
+
+    # The server's escape hatch for overriding this client's own backoff and
+    # retryableStatusCodes: absent, malformed, or non-numeric all mean "the
+    # server said nothing", not "stop retrying".
+    def retry_pushback_ms(metadata)
+      value = metadata && metadata['grpc-retry-pushback-ms']
+      return nil if value.nil?
+      Integer(value)
+    rescue ArgumentError, TypeError
+      nil
     end
 
     # Runs the interceptor chain and resolves metadata/credentials exactly once

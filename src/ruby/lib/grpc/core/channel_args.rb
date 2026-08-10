@@ -22,6 +22,10 @@ module GRPC
     # @api private
     module ChannelArgs
       SSL_TARGET_NAME_OVERRIDE = 'grpc.ssl_target_name_override'
+      CLIENT_IDLE_TIMEOUT_MS = 'grpc.client_idle_timeout_ms'
+      MAX_CONNECTION_IDLE_MS = 'grpc.max_connection_idle_ms'
+      MAX_CONNECTION_AGE_MS = 'grpc.max_connection_age_ms'
+      MAX_CONNECTION_AGE_GRACE_MS = 'grpc.max_connection_age_grace_ms'
       ENABLE_CENSUS = 'grpc.census'
       MAX_CONCURRENT_STREAMS = 'grpc.max_concurrent_streams'
       MAX_RECEIVE_MESSAGE_LENGTH = 'grpc.max_receive_message_length'
@@ -33,17 +37,15 @@ module GRPC
       KEEPALIVE_TIME_MS = 'grpc.keepalive_time_ms'
       KEEPALIVE_TIMEOUT_MS = 'grpc.keepalive_timeout_ms'
       KEEPALIVE_PERMIT_WITHOUT_CALLS = 'grpc.keepalive_permit_without_calls'
-      CLIENT_IDLE_TIMEOUT_MS = 'grpc.client_idle_timeout_ms'
-      MAX_CONNECTION_IDLE_MS = 'grpc.max_connection_idle_ms'
-      MAX_CONNECTION_AGE_MS = 'grpc.max_connection_age_ms'
-      MAX_CONNECTION_AGE_GRACE_MS = 'grpc.max_connection_age_grace_ms'
-      MAX_METADATA_SIZE = 'grpc.max_metadata_size'
       LB_POLICY_NAME = 'grpc.lb_policy_name'
       ENABLE_HTTP_PROXY = 'grpc.enable_http_proxy'
       COMPRESSION_ENABLED_ALGORITHMS_BITSET =
         'grpc.compression_enabled_algorithms_bitset'
       DEFAULT_COMPRESSION_ALGORITHM = 'grpc.default_compression_algorithm'
       DEFAULT_COMPRESSION_LEVEL = 'grpc.default_compression_level'
+      MAX_METADATA_SIZE = 'grpc.max_metadata_size'
+      SERVICE_CONFIG = 'grpc.service_config'
+      ENABLE_RETRIES = 'grpc.enable_retries'
 
       # Every argument in the "grpc." namespace that this implementation
       # actually acts on. Anything else in that namespace is a gRPC argument
@@ -58,6 +60,7 @@ module GRPC
         DEFAULT_COMPRESSION_ALGORITHM,
         DEFAULT_COMPRESSION_LEVEL,
         ENABLE_HTTP_PROXY,
+        ENABLE_RETRIES,
         KEEPALIVE_PERMIT_WITHOUT_CALLS,
         KEEPALIVE_TIME_MS,
         KEEPALIVE_TIMEOUT_MS,
@@ -71,6 +74,7 @@ module GRPC
         MAX_SEND_MESSAGE_LENGTH,
         PRIMARY_USER_AGENT,
         SECONDARY_USER_AGENT,
+        SERVICE_CONFIG,
         SO_REUSEPORT,
         SSL_TARGET_NAME_OVERRIDE
       ].freeze
@@ -85,6 +89,15 @@ module GRPC
       DEFAULT_MAX_METADATA_SIZE = 8 * 1024
 
       module_function
+
+      # Reads a millisecond argument as seconds, which is what every timer in
+      # this core works in. Returns nil when unset, and treats a non-positive
+      # value as unset, as gRPC does.
+      def seconds(args, key)
+        ms = args[key]
+        return nil unless ms.is_a?(Integer) && ms.positive?
+        ms / 1000.0
+      end
 
       # Converts the user-supplied hash into a String-keyed hash whose values
       # are Strings or Integers, raising the same TypeErrors the C extension
@@ -172,15 +185,6 @@ module GRPC
           fail TypeError,
                "#{key}: bad value: got <#{value.class}>, want <String|Fixnum>"
         end
-      end
-
-      # Reads a millisecond argument as seconds, which is what every timer in
-      # this core works in. Returns nil when unset, and treats a non-positive
-      # value as unset, as gRPC does.
-      def seconds(args, key)
-        ms = args[key]
-        return nil unless ms.is_a?(Integer) && ms.positive?
-        ms / 1000.0
       end
 
       # Reads an integer argument, falling back to +default+.
