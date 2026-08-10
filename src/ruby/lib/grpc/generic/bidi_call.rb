@@ -122,8 +122,13 @@ module GRPC
 
     # performs a read using @call.run_batch, ensures metadata is set up
     def read_using_run_batch
-      ops = { RECV_MESSAGE => nil }
-      ops[RECV_INITIAL_METADATA] = nil unless @metadata_received
+      # Shared and frozen after the first message: the batch carries no
+      # values, and #run_batch only reads the hash it is given.
+      ops = if @metadata_received
+              ActiveCall::RECV_MESSAGE_ONLY
+            else
+              { RECV_MESSAGE => nil, RECV_INITIAL_METADATA => nil }
+            end
       begin
         batch_result = @call.run_batch(ops)
         unless @metadata_received
@@ -144,6 +149,9 @@ module GRPC
       GRPC::Core.fork_unsafe_begin
       GRPC.logger.debug('bidi-write-loop: starting')
       count = 0
+      # One hash, refilled per message. This loop is the only thread sending
+      # on this call, and #run_batch does not keep what it is given.
+      send_ops = { SEND_MESSAGE => nil }
       requests.each do |req|
         GRPC.log_debug { "bidi-write-loop: #{count}" }
         count += 1
@@ -151,7 +159,8 @@ module GRPC
         # Fails if status already received
         begin
           @req_view.send_initial_metadata unless @req_view.nil?
-          @call.run_batch(SEND_MESSAGE => payload)
+          send_ops[SEND_MESSAGE] = payload
+          @call.run_batch(send_ops)
         rescue GRPC::Core::CallError => e
           # This is almost definitely caused by a status arriving while still
           # writing. Don't re-throw the error

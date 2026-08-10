@@ -42,6 +42,11 @@ module GRPC
   class ActiveCall # rubocop:disable Metrics/ClassLength
     include Core::TimeConsts
     include Core::CallOps
+
+    # The read batch used for every message after the first, once the initial
+    # metadata has arrived. It carries no values, so one frozen copy serves
+    # every read rather than a new hash per message.
+    RECV_MESSAGE_ONLY = { Core::CallOps::RECV_MESSAGE => nil }.freeze
     extend Forwardable
     attr_reader :deadline, :metadata_sent, :metadata_to_send, :peer, :peer_cert
     def_delegators :@call, :cancel, :cancel_with_status, :metadata,
@@ -256,8 +261,14 @@ module GRPC
     # On receiving a status, it returns nil if the status is OK, otherwise
     # raising BadStatus
     def remote_read
-      ops = { RECV_MESSAGE => nil }
-      ops[RECV_INITIAL_METADATA] = nil unless @metadata_received
+      # After the first message this batch is the same every time, and
+      # #run_batch only reads the hash it is given, so one frozen copy serves
+      # every read instead of a new hash per message.
+      ops = if @metadata_received
+              RECV_MESSAGE_ONLY
+            else
+              { RECV_MESSAGE => nil, RECV_INITIAL_METADATA => nil }
+            end
       batch_result = @call.run_batch(ops)
       unless @metadata_received
         @call.metadata = batch_result.metadata
@@ -400,7 +411,13 @@ module GRPC
       raise_error_if_already_executed
       begin
         send_initial_metadata(metadata)
-        requests.each { |r| @call.run_batch(SEND_MESSAGE => @marshal.call(r)) }
+        # One hash, refilled per message. #run_batch does not keep it, and
+        # this loop is the only thread sending on this call.
+        send_ops = { SEND_MESSAGE => nil }
+        requests.each do |r|
+          send_ops[SEND_MESSAGE] = @marshal.call(r)
+          @call.run_batch(send_ops)
+        end
       rescue GRPC::Core::CallError => e
         receive_and_check_status # check for Cancelled
         raise e
