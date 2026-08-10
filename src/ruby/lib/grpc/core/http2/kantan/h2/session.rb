@@ -91,6 +91,23 @@ module Kantan
           out
         end
 
+        # grpc: makes +count+ bytes available without copying them out, so a
+        # caller that is going to append them somewhere can do that straight
+        # from this buffer. Blocks; #append_into afterwards does not.
+        def ensure count
+          fill(count)
+        end
+
+        # grpc: appends +count+ already-buffered bytes to +target+. Pair with
+        # #ensure. A DATA payload used to be cut out into its own String here
+        # and copied again into the stream's receive buffer; this copies once
+        # and allocates nothing.
+        def append_into target, count
+          Body.append_slice(target, @buf, @pos, count)
+          @pos += count
+          count
+        end
+
         def readbyte
           raise EOFError unless fill(1)
           byte = @buf.getbyte(@pos)
@@ -937,9 +954,11 @@ module Kantan
         end
 
         if data_len > 0
-          chunk = io.read(data_len)
+          # Fill first, with no lock held: #on_data_into appends under the
+          # stream's own lock and must not block on the socket there.
+          raise EOFError unless io.ensure(data_len)
           stream.data_received += data_len
-          @handler.on_data stream, chunk
+          @handler.on_data_into stream, io, data_len
         end
 
         # Read and discard padding

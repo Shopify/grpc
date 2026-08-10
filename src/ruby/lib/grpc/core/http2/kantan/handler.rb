@@ -13,7 +13,15 @@ module GRPC
 module Kantan
   class Handler
     def on_headers stream; end
+    # grpc: called instead of #on_data, with the frame reader positioned on
+    # +len+ buffered payload bytes. Handlers that want the payload as a String
+    # get one here; those that are going to append it somewhere override this
+    # and take the bytes without a copy.
     def on_data stream, chunk; end
+
+    def on_data_into stream, reader, len
+      on_data(stream, reader.read(len))
+    end
     def on_request stream; end
     # grpc: trailing HEADERS blocks and peer RST_STREAM both need to reach the
     # RPC that is blocked on the stream.

@@ -105,18 +105,49 @@ module GRPC
         end
       end
 
+      # Takes +len+ buffered bytes from the frame reader straight into the
+      # receive buffer. The reader has already made them available, so nothing
+      # here blocks while the lock is held.
+      def append_data(reader, len)
+        @mu.synchronize do
+          compact_locked
+          size_buffer_locked(len)
+          reader.append_into(@buffer, len)
+          @cv.broadcast
+        end
+      end
+
       def push_data(chunk)
         @mu.synchronize do
-          # Drop the consumed prefix before it can dominate the buffer. A
-          # reader that keeps up clears it in #advance instead, so this only
-          # runs when a message is being assembled from many frames.
-          if @read_pos >= COMPACT_THRESHOLD
-            @buffer[0, @read_pos] = EMPTY
-            @read_pos = 0
-          end
+          compact_locked
+          size_buffer_locked(chunk.bytesize)
           @buffer << chunk
           @cv.broadcast
         end
+      end
+
+      # Drops the consumed prefix before it can dominate the buffer. A reader
+      # that keeps up clears it in #advance instead, so this only runs while a
+      # message is being assembled from many frames. Call with @mu held.
+      def compact_locked
+        return if @read_pos < COMPACT_THRESHOLD
+        @buffer[0, @read_pos] = EMPTY
+        @read_pos = 0
+      end
+
+      # Speculative: a chunk this large is usually one frame of a message that
+      # needs several, so the buffer is given that much room at once rather
+      # than reallocating and copying its way up. Nothing here promises more
+      # data is coming; a message ending exactly on a frame boundary simply
+      # leaves the extra room unused. The size test comes first, so a stream
+      # of small messages fails it on one comparison and pays nothing else.
+      # The buffer holds no data when this replaces it, so it loses nothing,
+      # and it need not know where a message begins. Call with @mu held.
+      def size_buffer_locked(incoming)
+        return unless incoming >= BUFFER_SIZE_TRIGGER && @buffer.empty?
+        want = incoming * BUFFER_SIZE_RATIO
+        return if want > BUFFER_SIZE_MAX
+        @buffer = String.new(encoding: Encoding::BINARY, capacity: want)
       end
 
       def push_trailers(pairs)

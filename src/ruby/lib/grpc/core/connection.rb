@@ -188,6 +188,15 @@ module GRPC
         stream&.push_data(chunk)
       end
 
+      # The payload is still in the frame reader's buffer, so it goes straight
+      # into the stream's receive buffer. Cutting a String out for it first
+      # was the largest single allocation site in an RPC.
+      def on_data_into(kstream, reader, len)
+        stream = @mu.synchronize { @streams[kstream.id] }
+        return reader.skip(len) if stream.nil?
+        stream.append_data(reader, len)
+      end
+
       def on_trailers(kstream, headers)
         stream = @mu.synchronize { @streams[kstream.id] }
         stream&.push_trailers(headers)
