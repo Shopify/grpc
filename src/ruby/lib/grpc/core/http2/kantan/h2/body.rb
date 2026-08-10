@@ -25,6 +25,38 @@ module Kantan
         end
       end
 
+      # grpc: appends bytes [+offset+, +len+) of +str+ to a binary buffer,
+      # without cutting a String out of it first. The five argument form of
+      # String#bytesplice copies straight from one buffer into the other, so
+      # framing a large message no longer allocates a slice per DATA frame
+      # and copies it twice.
+      #
+      # It carries the same encoding rule as String#<<, so it is only used
+      # when the source is already binary, which every frame this library
+      # builds is. Anything else falls back to the slice.
+      BYTESPLICE_APPENDS =
+        begin
+          probe = String.new(encoding: Encoding::BINARY)
+          probe.bytesplice(0, 0, 'ab'.b, 0, 1)
+          probe == 'a'.b
+        rescue StandardError, ArgumentError
+          false
+        end
+
+      if BYTESPLICE_APPENDS
+        def self.append_slice buf, str, offset, len
+          if str.encoding == Encoding::BINARY
+            buf.bytesplice(buf.bytesize, 0, str, offset, len)
+          else
+            append_bytes(buf, str.byteslice(offset, len))
+          end
+        end
+      else
+        def self.append_slice buf, str, offset, len
+          append_bytes(buf, str.byteslice(offset, len))
+        end
+      end
+
       class Buffer
         def initialize string
           @string = string
@@ -57,7 +89,7 @@ module Kantan
             # frame. Appending it directly saves slicing a copy first.
             Body.append_bytes(buf, @string)
           else
-            Body.append_bytes(buf, @string.byteslice(@offset, n))
+            Body.append_slice(buf, @string, @offset, n)
           end
           @offset += n
           n
