@@ -43,6 +43,22 @@ module GRPC
 
       ACCEPT_ENCODING = 'identity,deflate,gzip'
 
+      # The trailer names a client strips before handing metadata back.
+      STATUS_TRAILERS = %w[grpc-status grpc-message].freeze
+
+      PERCENT = '%'
+      PERCENT_BYTE = '%'.ord
+
+      # Percent coding tables, read by byte so neither direction has to run a
+      # regexp or cut a String out to convert two hex digits.
+      HEX_DIGITS = '0123456789ABCDEF'.bytes.freeze
+      HEX_VALUES = begin
+        table = []
+        '0123456789abcdef'.each_byte.with_index { |b, v| table[b] = v }
+        '0123456789ABCDEF'.each_byte.with_index { |b, v| table[b] = v }
+        table.freeze
+      end
+
       attr_reader :metadata, :trailing_metadata, :status, :write_flag
 
       # Builds the client side of a call. Internal; use Channel#create_call.
@@ -590,15 +606,64 @@ module GRPC
       end
 
       # grpc-message uses percent encoding for bytes outside %x20-%x7E and '%'.
+      #
+      # Almost every status message is already safe, and the common one is
+      # empty, so the bytes are scanned first. Going straight to the rewrite
+      # cost a String#b copy and a gsub result on every RPC to produce the
+      # same text back.
       def percent_encode(text)
-        text.b.gsub(/[^\x20-\x24\x26-\x7e]/n) do |byte|
-          format('%%%02X', byte.ord)
+        return text unless percent_unsafe?(text)
+        size = text.bytesize
+        out = String.new(encoding: Encoding::BINARY, capacity: size + 8)
+        i = 0
+        while i < size
+          byte = text.getbyte(i)
+          if byte < 0x20 || byte > 0x7e || byte == PERCENT_BYTE
+            out << PERCENT_BYTE << HEX_DIGITS[byte >> 4] << HEX_DIGITS[byte & 0xf]
+          else
+            out << byte
+          end
+          i += 1
         end
+        out
       end
 
+      # True when any byte has to be escaped. Scanned first because almost
+      # every status message is already safe, and the common one is empty.
+      def percent_unsafe?(text)
+        i = 0
+        size = text.bytesize
+        while i < size
+          byte = text.getbyte(i)
+          return true if byte < 0x20 || byte > 0x7e || byte == PERCENT_BYTE
+          i += 1
+        end
+        false
+      end
+
+      # The reverse. A message with no escape in it is returned as it is:
+      # gsub would allocate a copy to hand back the same characters.
       def percent_decode(text)
-        text.gsub(/%([0-9A-Fa-f]{2})/) { Regexp.last_match(1).hex.chr }
-            .force_encoding(Encoding::UTF_8)
+        return text if text.encoding == Encoding::UTF_8 &&
+                       !text.include?(PERCENT)
+        size = text.bytesize
+        out = String.new(encoding: Encoding::BINARY, capacity: size)
+        i = 0
+        while i < size
+          byte = text.getbyte(i)
+          if byte == PERCENT_BYTE && i + 2 < size
+            high = HEX_VALUES[text.getbyte(i + 1)]
+            low = HEX_VALUES[text.getbyte(i + 2)]
+            if high && low
+              out << ((high << 4) | low)
+              i += 3
+              next
+            end
+          end
+          out << byte
+          i += 1
+        end
+        out.force_encoding(Encoding::UTF_8)
       end
     end
   end
