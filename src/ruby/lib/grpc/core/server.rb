@@ -267,7 +267,7 @@ module GRPC
       end
 
       def public_metadata(headers)
-        Metadata.decode(headers.reject { |n, _| RESERVED_HEADERS.include?(n) })
+        Metadata.decode(headers, RESERVED_HEADERS)
       end
 
       def deadline_from(timeout)

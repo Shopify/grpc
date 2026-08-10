@@ -91,9 +91,13 @@ module GRPC
       # @param pairs [Array<Array(String, String)>] received header pairs
       # @return [Hash] repeated keys collapse into an Array, matching the shape
       #   grpc_rb_md_ary_to_h produced
-      def decode(pairs)
+      # +skip+ names are dropped as they are met. Callers used to filter the
+      # list first, which built a second array of pairs per RPC only to walk
+      # it once here.
+      def decode(pairs, skip = nil)
         pairs.each_with_object({}) do |(name, value), out|
           next if name.start_with?(':')
+          next if skip&.include?(name)
           decoded = name.end_with?(BINARY_SUFFIX) ? decode_binary(value) : value
           existing = out[name]
           if existing.nil?

@@ -554,8 +554,7 @@ module GRPC
                               'Missing grpc-status in trailers', {}, nil))
         end
         details = lookup(pairs, 'grpc-message')
-        metadata = Metadata.decode(
-          pairs.reject { |n, _| %w[grpc-status grpc-message].include?(n) })
+        metadata = Metadata.decode(pairs, STATUS_TRAILERS)
         with_debug(Struct::Status.new(code.to_i,
                                       details ? percent_decode(details) : '',
                                       metadata, nil))
