@@ -160,9 +160,14 @@ module GRPC
         unless ops.is_a?(Hash)
           fail TypeError, 'call#run_batch: ops hash should be a hash'
         end
-        ordered = validate_ops(ops)
+        validate_ops(ops)
         result = Struct::BatchResult.new(nil, nil, nil, nil, nil, nil, nil, nil)
-        ordered.each { |op| apply_op(op, ops[op], result) }
+        # Walked in order rather than filtered into a list first. The filter
+        # tested every operation anyway, so this does the same work without
+        # allocating the list.
+        OP_ORDER.each do |op|
+          apply_op(op, ops[op], result) if ops.key?(op)
+        end
         release_finished_stream
         result
       end
@@ -263,7 +268,7 @@ module GRPC
             fail TypeError, "invalid operation : bad value #{key}"
           end
         end
-        OP_ORDER.select { |op| ops.key?(op) }
+        nil
       end
 
       def apply_op(code, value, result)
