@@ -72,7 +72,10 @@ module GRPC
       end
 
       # Seconds from +now+ until this deadline, or nil when it never expires.
-      def to_relative_seconds(now = Time.now)
+      # +now+ defaults to a clock reading rather than to Time.now, which
+      # allocated a Time object per call only to have #to_f taken off it. A
+      # Time is still accepted, since Float#to_f returns itself.
+      def to_relative_seconds(now = Process.clock_gettime(Process::CLOCK_REALTIME))
         return nil if infinite_future?
         return 0.0 if infinite_past?
         delta = to_f - now.to_f
