@@ -548,7 +548,30 @@ module GRPC
       # if any subchannel is, CONNECTING if any is, TRANSIENT_FAILURE only
       # once every one has failed. A nil @lb_policy means this channel has
       # already re-resolved past the subchannel reporting in; ignore it.
-      def on_subchannel_state_changed(_subchannel)
+      #
+      # +subchannel+ landing in IDLE while a sibling is still alive means
+      # a previously live connection just closed (e.g. a GOAWAY, or the
+      # peer dropping the socket) while that sibling keeps carrying
+      # traffic. #await_connection only calls #maybe_start_connect, which
+      # would otherwise redial it, when picking fails outright; as long
+      # as the sibling keeps #pick succeeding, this one would sit IDLE
+      # forever. Redialing it immediately here is what keeps every
+      # resolved address in use, not just whichever ones happened to
+      # answer last.
+      #
+      # Deliberately gated on a sibling being alive, not merely on the
+      # aggregate being something other than TRANSIENT_FAILURE: a lone
+      # subchannel (pick_first, or any policy with exactly one address)
+      # going straight from READY to IDLE aggregates to IDLE, never
+      # TRANSIENT_FAILURE, so that weaker guard still redialed it here,
+      # immediately, racing the exact backoff/reresolve path
+      # #schedule_reresolve_locked -> #await_connection already owns for
+      # "every address just failed" -- stamping a fresh @last_error from
+      # a retry nothing asked for, which #pick_or_error_locked could then
+      # hand a later, unrelated caller instead of that caller's own
+      # attempt. Requiring an alive sibling excludes exactly that case.
+      def on_subchannel_state_changed(subchannel)
+        redial = false
         @mu.synchronize do
           next if @destroyed || @lb_policy.nil?
           new_state = @lb_policy.connectivity_state
@@ -556,8 +579,10 @@ module GRPC
             @last_error = @lb_policy.last_error
             schedule_reresolve_locked
           end
+          redial = subchannel.state == ConnectivityStates::IDLE && @subchannels.any?(&:alive?)
           transition_locked(new_state)
         end
+        subchannel.maybe_connect if redial
       end
 
       # Every resolved address has failed. Reuses the same ReconnectBackoff
