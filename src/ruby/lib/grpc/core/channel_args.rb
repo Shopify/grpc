@@ -47,6 +47,10 @@ module GRPC
       HTTP2_MAX_PINGS_WITHOUT_DATA = 'grpc.http2.max_pings_without_data'
       HTTP2_MIN_TIME_BETWEEN_PINGS_MS = 'grpc.http2.min_time_between_pings_ms'
       HTTP2_MAX_PING_STRIKES = 'grpc.http2.max_ping_strikes'
+      INITIAL_RECONNECT_BACKOFF_MS = 'grpc.initial_reconnect_backoff_ms'
+      MIN_RECONNECT_BACKOFF_MS = 'grpc.min_reconnect_backoff_ms'
+      MAX_RECONNECT_BACKOFF_MS = 'grpc.max_reconnect_backoff_ms'
+      PER_MESSAGE_COMPRESSION = 'grpc.per_message_compression'
       SERVICE_CONFIG = 'grpc.service_config'
       ENABLE_RETRIES = 'grpc.enable_retries'
 
@@ -66,6 +70,7 @@ module GRPC
         HTTP2_MAX_PINGS_WITHOUT_DATA,
         HTTP2_MAX_PING_STRIKES,
         HTTP2_MIN_TIME_BETWEEN_PINGS_MS,
+        INITIAL_RECONNECT_BACKOFF_MS,
         ENABLE_RETRIES,
         KEEPALIVE_PERMIT_WITHOUT_CALLS,
         KEEPALIVE_TIME_MS,
@@ -76,8 +81,11 @@ module GRPC
         MAX_CONNECTION_AGE_MS,
         MAX_CONNECTION_IDLE_MS,
         MAX_METADATA_SIZE,
+        MAX_RECONNECT_BACKOFF_MS,
         MAX_RECEIVE_MESSAGE_LENGTH,
         MAX_SEND_MESSAGE_LENGTH,
+        MIN_RECONNECT_BACKOFF_MS,
+        PER_MESSAGE_COMPRESSION,
         PRIMARY_USER_AGENT,
         SECONDARY_USER_AGENT,
         SERVICE_CONFIG,

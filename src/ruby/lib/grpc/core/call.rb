@@ -313,8 +313,9 @@ module GRPC
         return if failed?
         ensure_started
         return if failed?
-        no_compress = !@write_flag.nil? &&
-                      (@write_flag & WriteFlags::NO_COMPRESS) != 0
+        no_compress = (!@write_flag.nil? &&
+                       (@write_flag & WriteFlags::NO_COMPRESS) != 0) ||
+                      (@client && !@channel.per_message_compression?)
         @stream.send_message(value, no_compress: no_compress)
       rescue RpcStream::ResourceExhausted => e
         record_status(StatusCodes::RESOURCE_EXHAUSTED, e.message)

@@ -21,6 +21,7 @@ require_relative 'connection'
 require_relative 'constants'
 require_relative 'credentials'
 require_relative 'lb_policy'
+require_relative 'reconnect_backoff'
 require_relative 'service_config'
 require_relative 'subchannel'
 require_relative 'transport'
@@ -40,7 +41,6 @@ module GRPC
 
       # Minimum gap between connection attempts, so a hard-down target cannot
       # spin the reconnect loop.
-      RECONNECT_BACKOFF = 0.05
 
       # How often #await_connection re-checks after a wait, bounding the
       # cost of a missed wakeup instead of trying to eliminate it: waking
@@ -69,6 +69,7 @@ module GRPC
         @credentials = resolve_credentials(credentials)
         @parsed_target = Transport.parse_target(target)
         read_channel_args
+        @backoff = build_backoff
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @state = ConnectivityStates::IDLE
@@ -123,6 +124,22 @@ module GRPC
         @http2_max_ping_strikes = ChannelArgs.int(
           @args, ChannelArgs::HTTP2_MAX_PING_STRIKES,
           Connection::DEFAULT_MAX_PING_STRIKES)
+        @per_message_compression = !ChannelArgs.int(
+          @args, ChannelArgs::PER_MESSAGE_COMPRESSION, 1
+        ).zero?
+      end
+
+      # grpc.initial/min/max_reconnect_backoff_ms in milliseconds, converted
+      # to the seconds every timer in this core works in.
+      def build_backoff
+        initial = ChannelArgs.int(@args, ChannelArgs::INITIAL_RECONNECT_BACKOFF_MS, 1_000) / 1000.0
+        min = ChannelArgs.int(@args, ChannelArgs::MIN_RECONNECT_BACKOFF_MS, 1_000) / 1000.0
+        max = ChannelArgs.int(@args, ChannelArgs::MAX_RECONNECT_BACKOFF_MS, 120_000) / 1000.0
+        ReconnectBackoff.new(initial: initial, min: min, max: max)
+      end
+
+      def per_message_compression?
+        @per_message_compression
       end
 
       def initialize_copy(_other)
@@ -401,7 +418,7 @@ module GRPC
         end
       end
 
-      # Every resolved address has failed. Reuses RECONNECT_BACKOFF -- the
+      # Every resolved address has failed. Reuses the configured backoff -- the
       # same gap a single connection attempt always waited out after a
       # failure -- rather than inventing a second backoff scheme, then
       # re-resolves so a DNS change, or an address that is reachable again,
@@ -410,7 +427,8 @@ module GRPC
       def schedule_reresolve_locked
         return if @idle_timer
         @idle_timer = Thread.new do
-          sleep RECONNECT_BACKOFF
+          delay = @backoff.next_delay
+          sleep delay
           subchannels = @mu.synchronize do
             @idle_timer = nil
             next nil if @destroyed
@@ -427,6 +445,7 @@ module GRPC
       end
 
       def transition_locked(state)
+        @backoff.reset if state == ConnectivityStates::READY
         return if @state == state
         @state = state
         @cv.broadcast
