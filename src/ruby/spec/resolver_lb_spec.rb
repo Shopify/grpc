@@ -20,8 +20,8 @@ require 'spec_helper'
 # return, and a Channel held exactly one connection. Real DNS names can have
 # several A/AAAA records, and a caller who wants every RPC on the same dead
 # address to keep failing has no recourse without resolving them all and
-# picking among them. DNS SRV records and service config published over a
-# DNS TXT record are out of scope; only A/AAAA are walked.
+# picking among them. SRV records and service config over DNS TXT are
+# covered by dns_srv_spec.rb.
 AddressTarget = GRPC::Core::Transport::Target
 States = GRPC::Core::ConnectivityStates
 describe 'DNS resolution to multiple addresses and load balancing' do

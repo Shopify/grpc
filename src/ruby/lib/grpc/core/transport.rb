@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require 'openssl'
+require 'resolv'
 require 'socket'
 require 'uri'
 
@@ -39,7 +40,10 @@ module GRPC
       # scheme is :tcp or :unix. +addresses+ is populated by
       # #resolve_addresses: nil until then, and afterwards the list of
       # every A/AAAA record +host+ named (each itself a :tcp Target whose
-      # host is a literal address), or [self] for a :unix target.
+      # host is a literal address), or [self] for a :unix target. A target
+      # has no real network host/port of its own -- #path carries the
+      # resource name instead, and #host mirrors it so TLS hostname
+      # verification has something to check when no override is given.
       Target = Struct.new(:scheme, :host, :port, :path, :addresses) do
         def to_peer
           return "unix:#{path}" if scheme == :unix
@@ -55,8 +59,8 @@ module GRPC
       module_function
 
       # Understands the target forms grpc-ruby users actually pass: a bare
-      # host:port, the dns:, ipv4:, ipv6: and unix: schemes, and bracketed
-      # IPv6 literals.
+      # host:port, the dns:, ipv4:, ipv6: and unix: schemes, and
+      # bracketed IPv6 literals.
       KNOWN_SCHEMES = %w[dns ipv4 ipv6 unix].freeze
 
       def parse_target(target)
@@ -72,26 +76,70 @@ module GRPC
       # records alike, via the system resolver -- rather than just the one
       # a single lookup happens to return first, so an LB policy can hold a
       # subchannel per address instead of leaving that fan-out to whatever
-      # Socket.tcp did internally. DNS SRV records and service config
-      # published over a DNS TXT record are out of scope; this only walks
-      # A/AAAA. A :unix target has nothing to resolve.
+      # Socket.tcp did internally. With grpc.dns_enable_srv_queries set,
+      # SRV records take priority over the plain A/AAAA lookup; see
+      # #srv_addresses. A :unix target has nothing to resolve.
       #
       # Mutates +target.addresses+ and also returns it.
-      def resolve_addresses(target)
-        target.addresses = target.scheme == :unix ? [target] : dns_addresses(target)
+      def resolve_addresses(target, args = {})
+        target.addresses =
+          case target.scheme
+          when :unix then [target]
+          else dns_addresses(target, args)
+          end
       end
 
-      def dns_addresses(target)
-        Addrinfo.getaddrinfo(target.host, target.port, nil, :STREAM)
-                .map { |ai| Target.new(:tcp, ai.ip_address, target.port, nil) }
+      def dns_addresses(target, args)
+        if ChannelArgs.int(args, ChannelArgs::DNS_ENABLE_SRV_QUERIES, 0) != 0
+          srv = srv_addresses(target)
+          return srv unless srv.empty?
+        end
+        a_addresses(target, target.port)
+      end
+
+      def a_addresses(target, port)
+        Addrinfo.getaddrinfo(target.host, port, nil, :STREAM)
+                .map { |ai| Target.new(:tcp, ai.ip_address, port, nil) }
                 .uniq(&:host)
       end
 
-      # "xds:///service" used to parse as the host "xds" on port 0, so the
-      # channel was built and only failed later, connecting to a name the
-      # caller never wrote. A scheme this implementation does not resolve has
-      # to say so. Only the "scheme://" form is treated as a scheme, because
-      # "localhost:50051" is a host and a port.
+      # "_grpc_config._tcp.<host>" is the SRV name gRPC's DNS resolver
+      # queries for (see A5, grpclb-in-dns); each record it returns names a
+      # target host and port to resolve in turn, standing in for a plain
+      # A/AAAA lookup on +target+ itself. Ordered by ascending priority
+      # (lower tries first) and, within a priority, descending weight,
+      # matching the preference gRPC's weighted-random selection encodes
+      # without reproducing the randomness -- there is no separate LB
+      # concept of SRV weight for a deterministic pure Ruby core to defer
+      # to. Returns [] when the host has no SRV record, so the caller
+      # falls back to a plain A/AAAA lookup exactly as gRPC's DNS resolver
+      # does.
+      def srv_addresses(target)
+        records = Resolv::DNS.open do |dns|
+          dns.getresources("_grpc_config._tcp.#{target.host}", Resolv::DNS::Resource::IN::SRV)
+        end
+        records.sort_by { |r| [r.priority, -r.weight] }
+               .flat_map { |r| a_addresses(Target.new(:tcp, r.target.to_s, r.port, nil), r.port) }
+      end
+
+      # Reads the "grpc_config=" TXT record gRPC's DNS-based service
+      # config publishing convention names (A2, service-configs-in-dns),
+      # and returns the JSON payload following that prefix, or nil when
+      # +target+ has no such record. Only a :tcp target has a DNS host to
+      # query; :unix has no name server involved.
+      def service_config_json(target)
+        return nil unless target.scheme == :tcp
+        records = Resolv::DNS.open { |dns| dns.getresources(target.host, Resolv::DNS::Resource::IN::TXT) }
+        match = records.map(&:data).find { |text| text.start_with?('grpc_config=') }
+        match&.delete_prefix('grpc_config=')
+      end
+
+      # "google-c2p:///service" (and any other scheme this implementation
+      # does not resolve) used to parse as the host "google-c2p" on port 0,
+      # so the channel was built and only failed later, connecting to a
+      # name the caller never wrote. A scheme this implementation does not
+      # resolve has to say so. Only the "scheme://" form is treated as a
+      # scheme, because "localhost:50051" is a host and a port.
       def reject_unknown_scheme(str)
         mark = str.index('://')
         return if mark.nil?
@@ -173,7 +221,7 @@ module GRPC
       # common case, when no proxy applies. Unix targets never proxy, mirroring
       # C-core.
       def proxy_for(target, args)
-        return nil if target.scheme == :unix
+        return nil if [:unix, :xds].include?(target.scheme)
         return nil if ChannelArgs.int(args, ChannelArgs::ENABLE_HTTP_PROXY, 1).zero?
         uri_str = PROXY_ENV_VARS.map { |name| ENV[name] }.find { |v| v && !v.empty? }
         return nil if uri_str.nil?

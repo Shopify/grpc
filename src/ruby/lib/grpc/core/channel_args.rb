@@ -51,6 +51,8 @@ module GRPC
       MIN_RECONNECT_BACKOFF_MS = 'grpc.min_reconnect_backoff_ms'
       MAX_RECONNECT_BACKOFF_MS = 'grpc.max_reconnect_backoff_ms'
       PER_MESSAGE_COMPRESSION = 'grpc.per_message_compression'
+      DNS_ENABLE_SRV_QUERIES = 'grpc.dns_enable_srv_queries'
+      SERVICE_CONFIG_DISABLE_RESOLUTION = 'grpc.service_config_disable_resolution'
       SERVICE_CONFIG = 'grpc.service_config'
       ENABLE_RETRIES = 'grpc.enable_retries'
 
@@ -66,6 +68,7 @@ module GRPC
         DEFAULT_AUTHORITY,
         DEFAULT_COMPRESSION_ALGORITHM,
         DEFAULT_COMPRESSION_LEVEL,
+        DNS_ENABLE_SRV_QUERIES,
         ENABLE_HTTP_PROXY,
         HTTP2_MAX_PINGS_WITHOUT_DATA,
         HTTP2_MAX_PING_STRIKES,
@@ -89,6 +92,7 @@ module GRPC
         PRIMARY_USER_AGENT,
         SECONDARY_USER_AGENT,
         SERVICE_CONFIG,
+        SERVICE_CONFIG_DISABLE_RESOLUTION,
         SO_REUSEPORT,
         SSL_TARGET_NAME_OVERRIDE
       ].freeze
