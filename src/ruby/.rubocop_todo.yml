@@ -211,7 +211,7 @@ Layout/SpaceInsideHashLiteralBraces:
   Exclude:
     - 'qps/server.rb'
 
-# Offense count: 5
+# Offense count: 6
 # This cop supports safe autocorrection (--autocorrect).
 Layout/SpaceInsidePercentLiteralDelimiters:
   Exclude:
@@ -905,18 +905,23 @@ Style/ZeroLengthPredicate:
 Layout/LineLength:
   Max: 186
 
-# Offense count: 4
+# Offense count: 6
 # GRPC::Core::Call implements the whole run_batch operation surface, which the
 # C extension expressed in one file too. Channel, Connection and Server each
 # grew past the limit carrying the connection-management features the C
 # extension got from core: keepalive, connection lifetime limits, subchannels
-# and load balancing.
+# and load balancing. XdsClient is one class per the whole LDS/RDS/CDS/EDS
+# chain, which is one protocol conversation and reads worse split up.
+# ClientStub carries four call shapes, each now with a retry and a hedging
+# variant.
 Metrics/ClassLength:
   Exclude:
     - 'lib/grpc/core/call.rb'
     - 'lib/grpc/core/channel.rb'
     - 'lib/grpc/core/connection.rb'
     - 'lib/grpc/core/server.rb'
+    - 'lib/grpc/core/xds_client.rb'
+    - 'lib/grpc/generic/client_stub.rb'
 
 # Offense count: 2
 # GRPC::Core::Transport holds target parsing plus client and server TLS setup.

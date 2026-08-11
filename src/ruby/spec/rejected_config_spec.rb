@@ -17,9 +17,9 @@
 require 'spec_helper'
 
 # Configuration this implementation cannot act on has to say so. Accepting a
-# keepalive setting and never sending a PING, or parsing "xds:///service" as
-# the host "xds", leaves the caller to discover it from an outage instead of
-# from an error.
+# keepalive setting and never sending a PING, or parsing
+# "google-c2p:///service" as the host "google-c2p", leaves the caller to
+# discover it from an outage instead of from an error.
 describe 'configuration this implementation does not implement' do
   describe GRPC::Core::ChannelArgs do
     # grpc.census stands in for "a gRPC argument we do not implement". It is
@@ -68,8 +68,8 @@ describe 'configuration this implementation does not implement' do
 
   describe GRPC::Core::Transport do
     it 'rejects a scheme it cannot resolve' do
-      expect { described_class.parse_target('xds:///my-service') }
-        .to raise_error(ArgumentError, /unsupported target scheme "xds"/)
+      expect { described_class.parse_target('some-bogus-scheme:///my-service') }
+        .to raise_error(ArgumentError, /unsupported target scheme "some-bogus-scheme"/)
     end
 
     it 'rejects google-c2p, which it also cannot resolve' do
@@ -104,7 +104,7 @@ describe 'configuration this implementation does not implement' do
 
     it 'fails to build on a scheme it cannot resolve' do
       expect do
-        described_class.new('xds:///svc', nil, :this_channel_is_insecure)
+        described_class.new('google-c2p:///svc', nil, :this_channel_is_insecure)
       end.to raise_error(ArgumentError)
     end
   end

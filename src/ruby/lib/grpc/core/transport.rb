@@ -37,10 +37,11 @@ module GRPC
       PROXY_ENV_VARS = %w[grpc_proxy https_proxy http_proxy].freeze
       NO_PROXY_ENV_VARS = %w[no_grpc_proxy no_proxy].freeze
 
-      # scheme is :tcp or :unix. +addresses+ is populated by
+      # scheme is :tcp, :unix or :xds. +addresses+ is populated by
       # #resolve_addresses: nil until then, and afterwards the list of
       # every A/AAAA record +host+ named (each itself a :tcp Target whose
-      # host is a literal address), or [self] for a :unix target. A target
+      # host is a literal address), the endpoints an XdsClient resolved
+      # for an :xds target, or [self] for a :unix target. An :xds target
       # has no real network host/port of its own -- #path carries the
       # resource name instead, and #host mirrors it so TLS hostname
       # verification has something to check when no override is given.
@@ -59,17 +60,49 @@ module GRPC
       module_function
 
       # Understands the target forms grpc-ruby users actually pass: a bare
-      # host:port, the dns:, ipv4:, ipv6: and unix: schemes, and
+      # host:port, the dns:, ipv4:, ipv6:, unix: and xds: schemes, and
       # bracketed IPv6 literals.
-      KNOWN_SCHEMES = %w[dns ipv4 ipv6 unix].freeze
+      KNOWN_SCHEMES = %w[dns ipv4 ipv6 unix xds].freeze
 
       def parse_target(target)
         str = target.to_s
         reject_unknown_scheme(str)
         return Target.new(:unix, nil, nil, unix_path(str)) if str.start_with?('unix:')
+        return xds_target(str) if str.start_with?('xds:')
         str = strip_scheme(str)
         host, port = split_host_port(str)
         Target.new(:tcp, host, port, nil)
+      end
+
+      # "xds:///my-service" names a resource, not a host to look up; the
+      # authority-qualified form ("xds://authority/my-service") picks a
+      # non-default management server, which is federation and out of
+      # scope here, so it is rejected rather than silently mishandled.
+      # Loads (and validates) the bootstrap immediately so a bad
+      # GRPC_XDS_BOOTSTRAP fails channel construction, not the first RPC.
+      def xds_target(str)
+        rest = str.delete_prefix('xds:')
+        rest = rest.delete_prefix('//') if rest.start_with?('//')
+        if rest.include?('/') && !rest.start_with?('/')
+          fail ArgumentError,
+               "unsupported xds target #{str.inspect}: authority-qualified xds " \
+               'targets (federation) are not supported'
+        end
+        name = rest.delete_prefix('/')
+        fail ArgumentError, "bad xds target #{str.inspect}: missing resource name" if name.empty?
+        load_xds!
+        XdsClient.bootstrap!
+        Target.new(:xds, name, nil, name)
+      end
+
+      # xds_client.rb loads the generated Envoy protobuf classes, which is
+      # tens of thousands of objects that a dns: or unix: channel has no use
+      # for. Nothing requires it until a target actually names the xds
+      # scheme. require_relative is idempotent, so this costs one hash lookup
+      # per call after the first.
+      def load_xds!
+        require_relative 'xds_client'
+        true
       end
 
       # Resolves +target+'s host to every address it names -- A and AAAA
@@ -78,13 +111,16 @@ module GRPC
       # subchannel per address instead of leaving that fan-out to whatever
       # Socket.tcp did internally. With grpc.dns_enable_srv_queries set,
       # SRV records take priority over the plain A/AAAA lookup; see
-      # #srv_addresses. A :unix target has nothing to resolve.
+      # #srv_addresses. A :unix target has nothing to resolve; an :xds
+      # target asks the shared XdsClient for the endpoints its resource
+      # chain (LDS -> RDS -> CDS -> EDS) currently names.
       #
       # Mutates +target.addresses+ and also returns it.
       def resolve_addresses(target, args = {})
         target.addresses =
           case target.scheme
           when :unix then [target]
+          when :xds then (load_xds! and XdsClient.instance.resolve_endpoints(target.path))
           else dns_addresses(target, args)
           end
       end
@@ -126,7 +162,8 @@ module GRPC
       # config publishing convention names (A2, service-configs-in-dns),
       # and returns the JSON payload following that prefix, or nil when
       # +target+ has no such record. Only a :tcp target has a DNS host to
-      # query; :unix has no name server involved.
+      # query; :unix has no name server involved and :xds resolves its
+      # config, if any, through the xDS control plane instead.
       def service_config_json(target)
         return nil unless target.scheme == :tcp
         records = Resolv::DNS.open { |dns| dns.getresources(target.host, Resolv::DNS::Resource::IN::TXT) }

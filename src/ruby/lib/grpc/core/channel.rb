@@ -39,9 +39,6 @@ module GRPC
       MAX_CONCURRENT_STREAMS = :'grpc.max_concurrent_streams'
       MAX_MESSAGE_LENGTH = :'grpc.max_receive_message_length'
 
-      # Minimum gap between connection attempts, so a hard-down target cannot
-      # spin the reconnect loop.
-
       # How often #await_connection re-checks after a wait, bounding the
       # cost of a missed wakeup instead of trying to eliminate it: waking
       # this often is cheap next to a connection attempt, and it lets the
@@ -70,6 +67,11 @@ module GRPC
         @parsed_target = Transport.parse_target(target)
         read_channel_args
         @backoff = build_backoff
+        @service_config = build_service_config
+        @resolved_service_config = nil
+        @resolved_service_config_looked_up = false
+        @service_config_mu = Mutex.new
+        @enable_retries_arg = @args[ChannelArgs::ENABLE_RETRIES]
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @state = ConnectivityStates::IDLE
@@ -114,11 +116,6 @@ module GRPC
                "this implementation supports #{LB_POLICIES.keys.join(', ')}"
         end
         @client_idle_timeout = ChannelArgs.seconds(@args, ChannelArgs::CLIENT_IDLE_TIMEOUT_MS)
-        @service_config = build_service_config
-        @resolved_service_config = nil
-        @resolved_service_config_looked_up = false
-        @service_config_mu = Mutex.new
-        @enable_retries_arg = @args[ChannelArgs::ENABLE_RETRIES]
         @http2_max_pings_without_data = ChannelArgs.int(
           @args, ChannelArgs::HTTP2_MAX_PINGS_WITHOUT_DATA,
           Connection::DEFAULT_MAX_PINGS_WITHOUT_DATA)
@@ -132,65 +129,6 @@ module GRPC
         ).zero?
       end
 
-      def effective_service_config
-        @service_config || resolved_service_config
-      end
-
-      # Fetches and memoizes the "grpc_config=" TXT record the first time
-      # any call asks for a method config, rather than in #initialize, so
-      # that constructing a channel never blocks on DNS. Guarded by its own
-      # mutex, distinct from @mu, so a concurrent connection attempt never
-      # waits on this lookup or vice versa. A malformed resolver-supplied
-      # service config is ignored rather than raised: unlike a bad
-      # grpc.service_config argument, it was never something the caller
-      # wrote, and there is no reasonable way to fail channel construction
-      # over a record fetched well after the channel already exists.
-      def resolved_service_config
-        # Read the memo before taking the lock. This runs on every call, and
-        # the lookup happens once, so holding a mutex for the other several
-        # million reads serialised concurrent RPCs for nothing: it measured
-        # 12 per cent on the eight-thread benchmark. The flag is written once
-        # under the lock and only ever goes false to true, so a reader that
-        # misses it merely takes the slow path and re-checks inside.
-        return @resolved_service_config if @resolved_service_config_looked_up
-        @service_config_mu.synchronize do
-          next @resolved_service_config if @resolved_service_config_looked_up
-          config = parse_resolved_service_config(resolved_service_config_json)
-          @resolved_service_config = config
-          @resolved_service_config_looked_up = true
-          config
-        end
-      end
-
-      def parse_resolved_service_config(json)
-        return nil if json.nil?
-        ServiceConfig.new(json)
-      rescue ArgumentError
-        nil
-      end
-
-      # grpc.service_config_disable_resolution stops the resolver from
-      # supplying a service config at all -- not merged with, superseded
-      # by -- the grpc.service_config argument, which #effective_service_config
-      # already prefers and so never reaches this when it is set.
-      def resolved_service_config_json
-        return nil unless ChannelArgs.int(@args, ChannelArgs::SERVICE_CONFIG_DISABLE_RESOLUTION, 0).zero?
-        Transport.service_config_json(@parsed_target)
-      end
-
-      # grpc.initial/min/max_reconnect_backoff_ms in milliseconds, converted
-      # to the seconds every timer in this core works in.
-      def build_backoff
-        initial = ChannelArgs.int(@args, ChannelArgs::INITIAL_RECONNECT_BACKOFF_MS, 1_000) / 1000.0
-        min = ChannelArgs.int(@args, ChannelArgs::MIN_RECONNECT_BACKOFF_MS, 1_000) / 1000.0
-        max = ChannelArgs.int(@args, ChannelArgs::MAX_RECONNECT_BACKOFF_MS, 120_000) / 1000.0
-        ReconnectBackoff.new(initial: initial, min: min, max: max)
-      end
-
-      def per_message_compression?
-        @per_message_compression
-      end
-
       def initialize_copy(_other)
         fail TypeError,
              'Copy initialization of GRPC::Core::Channel is not supported'
@@ -198,6 +136,14 @@ module GRPC
 
       def secure?
         !@credentials.nil?
+      end
+
+      # Whether grpc.per_message_compression is enabled (the default), read
+      # by Call#op_send_message alongside a per-call WriteFlags::NO_COMPRESS
+      # so a channel-wide "never compress" setting has the same effect as
+      # asking for it on every message, without adding per-message work.
+      def per_message_compression?
+        @per_message_compression
       end
 
       def scheme
@@ -310,6 +256,7 @@ module GRPC
       def reset_after_fork!
         subchannels = @subchannels
         @mu = Mutex.new
+        @service_config_mu = Mutex.new
         @cv = ConditionVariable.new
         @subchannels = nil
         @lb_policy = nil
@@ -326,9 +273,75 @@ module GRPC
 
       # Malformed JSON in grpc.service_config must fail channel construction
       # rather than silently run without the timeouts and retries it names.
+      # The service config a resolver might supply over DNS is not parsed
+      # here: unlike the channel argument, it takes a real (if usually
+      # fast) DNS round trip, and #initialize must stay synchronous and
+      # cheap the way #parse_target already is -- most channels never make
+      # a call, and a construction that always paid for a TXT lookup would
+      # tax every one of them for a feature only some ever use. See
+      # #effective_service_config, which pays that cost, once, only for a
+      # channel whose first call actually needs it.
       def build_service_config
         json = ChannelArgs.str(@args, ChannelArgs::SERVICE_CONFIG)
         json.nil? ? nil : ServiceConfig.new(json)
+      end
+
+      # The service config that applies: the grpc.service_config argument
+      # if the caller gave one, otherwise the one #resolved_service_config
+      # lazily fetches over DNS, exactly as gRPC orders the two.
+      def effective_service_config
+        @service_config || resolved_service_config
+      end
+
+      # Fetches and memoizes the "grpc_config=" TXT record the first time
+      # any call asks for a method config, rather than in #initialize, so
+      # that constructing a channel never blocks on DNS. Guarded by its own
+      # mutex, distinct from @mu, so a concurrent connection attempt never
+      # waits on this lookup or vice versa. A malformed resolver-supplied
+      # service config is ignored rather than raised: unlike a bad
+      # grpc.service_config argument, it was never something the caller
+      # wrote, and there is no reasonable way to fail channel construction
+      # over a record fetched well after the channel already exists.
+      def resolved_service_config
+        # Read the memo before taking the lock. This runs on every call, and
+        # the lookup happens once, so holding a mutex for the other several
+        # million reads serialised concurrent RPCs for nothing: it measured
+        # 12 per cent on the eight-thread benchmark. The flag is written once
+        # under the lock and only ever goes false to true, so a reader that
+        # misses it merely takes the slow path and re-checks inside.
+        return @resolved_service_config if @resolved_service_config_looked_up
+        @service_config_mu.synchronize do
+          next @resolved_service_config if @resolved_service_config_looked_up
+          config = parse_resolved_service_config(resolved_service_config_json)
+          @resolved_service_config = config
+          @resolved_service_config_looked_up = true
+          config
+        end
+      end
+
+      def parse_resolved_service_config(json)
+        return nil if json.nil?
+        ServiceConfig.new(json)
+      rescue ArgumentError
+        nil
+      end
+
+      # grpc.service_config_disable_resolution stops the resolver from
+      # supplying a service config at all -- not merged with, superseded
+      # by -- the grpc.service_config argument, which #effective_service_config
+      # already prefers and so never reaches this when it is set.
+      def resolved_service_config_json
+        return nil unless ChannelArgs.int(@args, ChannelArgs::SERVICE_CONFIG_DISABLE_RESOLUTION, 0).zero?
+        Transport.service_config_json(@parsed_target)
+      end
+
+      # grpc.initial/min/max_reconnect_backoff_ms in milliseconds, converted
+      # to the seconds every timer in this core works in.
+      def build_backoff
+        initial = ChannelArgs.int(@args, ChannelArgs::INITIAL_RECONNECT_BACKOFF_MS, 1_000) / 1000.0
+        min = ChannelArgs.int(@args, ChannelArgs::MIN_RECONNECT_BACKOFF_MS, 1_000) / 1000.0
+        max = ChannelArgs.int(@args, ChannelArgs::MAX_RECONNECT_BACKOFF_MS, 120_000) / 1000.0
+        ReconnectBackoff.new(initial: initial, min: min, max: max)
       end
 
       def resolve_credentials(credentials)
@@ -353,6 +366,7 @@ module GRPC
 
       def default_authority
         return @parsed_target.path.to_s if @parsed_target.scheme == :unix
+        return @parsed_target.host if @parsed_target.scheme == :xds
         "#{@parsed_target.host}:#{@parsed_target.port}"
       end
 
@@ -475,16 +489,16 @@ module GRPC
         end
       end
 
-      # Every resolved address has failed. Reuses the configured backoff -- the
-      # same gap a single connection attempt always waited out after a
-      # failure -- rather than inventing a second backoff scheme, then
-      # re-resolves so a DNS change, or an address that is reachable again,
-      # gets picked up. Subchannels are closed after the lock is released,
-      # since #close reports back through #on_subchannel_state_changed.
+      # Every resolved address has failed. Reuses the same ReconnectBackoff
+      # sequence a single connection attempt already advances -- rather than
+      # inventing a second backoff scheme -- then re-resolves so a DNS
+      # change, or an address that is reachable again, gets picked up.
+      # Subchannels are closed after the lock is released, since #close
+      # reports back through #on_subchannel_state_changed.
       def schedule_reresolve_locked
         return if @idle_timer
+        delay = @backoff.next_delay
         @idle_timer = Thread.new do
-          delay = @backoff.next_delay
           sleep delay
           subchannels = @mu.synchronize do
             @idle_timer = nil
@@ -501,9 +515,12 @@ module GRPC
         @idle_timer.name = 'grpc-reresolve'
       end
 
+      # READY means some subchannel just dialed successfully, so the next
+      # failure should back off from grpc.initial_reconnect_backoff_ms
+      # again rather than continuing to grow from wherever it left off.
       def transition_locked(state)
-        @backoff.reset if state == ConnectivityStates::READY
         return if @state == state
+        @backoff.reset if state == ConnectivityStates::READY
         @state = state
         @cv.broadcast
       end
