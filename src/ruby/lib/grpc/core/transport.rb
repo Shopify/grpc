@@ -66,6 +66,18 @@ module GRPC
       # parsed out of a "user:password@" prefix on the proxy URL, if any.
       ProxyTarget = Struct.new(:host, :port, :user, :password)
 
+      # Returned by #watch_addresses for a target with nothing to push --
+      # :tcp (DNS only re-resolves on total failure; see
+      # Channel#resolve_worker) and :unix, neither of which ever
+      # subscribes to anything. #cancel is a no-op so a Channel's cleanup
+      # path never needs to special-case the scheme it dialed.
+      class NullWatch
+        def cancel
+          nil
+        end
+      end
+      NULL_ADDRESS_WATCH = NullWatch.new
+
       module_function
 
       # Understands the target forms grpc-ruby users actually pass: a bare
@@ -140,6 +152,24 @@ module GRPC
           when :xds then (load_xds! and xds_addresses(target))
           else dns_addresses(target, args)
           end
+      end
+
+      # Subscribes for a push whenever +target+'s resolved addresses
+      # change, for as long as the returned handle exists -- +block+ is
+      # called with the new Array<Transport::Target> each time. Distinct
+      # from #resolve_addresses, which stays a one-shot pull: nothing in a
+      # healthy Channel ever asks again on its own (see
+      # Channel#resolve_worker), so this is the only way it hears about a
+      # control-plane-pushed EDS update. Only an :xds target has anything
+      # to push; :tcp/:unix return #NULL_ADDRESS_WATCH. Loads xds_client.rb
+      # on demand, exactly as #resolve_addresses does, so a dns:/unix:
+      # channel never pays for the generated Envoy protobufs.
+      #
+      # @return an object responding to #cancel
+      def watch_addresses(target, _args = {}, &block)
+        return NULL_ADDRESS_WATCH unless target.scheme == :xds
+        load_xds!
+        XdsClient.instance.watch_endpoints(target.path, authority: target.xds_authority, &block)
       end
 
       # Federation (gRFC A47): #path is the plain resource name and

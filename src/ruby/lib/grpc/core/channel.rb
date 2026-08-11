@@ -87,6 +87,12 @@ module GRPC
         @resolving = false
         @resolve_thread = nil
         @idle_timer = nil
+        # The handle Transport.watch_addresses returned, set once by the
+        # first #resolve_worker and cancelled by #destroy; nil until then,
+        # and for the whole life of a tcp:/unix: channel, whose no-op
+        # handle is still stored here so #destroy has one uniform thing to
+        # cancel.
+        @resolver_watch = nil
         # Owned by, and only ever running while, the OutlierDetectionPolicy
         # it was started for is still @lb_policy -- see
         # #start_outlier_detection_timer_locked and #stop_outlier_detection_timer.
@@ -255,6 +261,7 @@ module GRPC
       def destroy
         subchannels = nil
         outlier_timer = nil
+        watch = nil
         @mu.synchronize do
           return nil if @destroyed
           @destroyed = true
@@ -263,10 +270,13 @@ module GRPC
           @lb_policy = nil
           outlier_timer = @outlier_detection_timer
           @outlier_detection_timer = nil
+          watch = @resolver_watch
+          @resolver_watch = nil
           @state = ConnectivityStates::FATAL_FAILURE
           @cv.broadcast
         end
         stop_outlier_detection_timer(outlier_timer)
+        watch&.cancel
         subchannels&.each(&:close)
         nil
       end
@@ -296,7 +306,12 @@ module GRPC
         @resolve_thread = nil
         @idle_timer = nil
         # Not woken/joined: a fork leaves no threads behind in the child,
-        # only the ivar naming one that no longer exists.
+        # only the ivar naming one that no longer exists. Likewise
+        # @resolver_watch is dropped rather than #cancel-ed: cancelling
+        # takes the (possibly inherited, possibly fork-locked) AdsConnection
+        # mutex, and nothing in this child will ever call the callback
+        # again anyway -- the ADS stream's thread did not survive the fork.
+        @resolver_watch = nil
         @outlier_detection_timer = nil
         @last_error = nil
         @state = ConnectivityStates::IDLE unless @destroyed
@@ -450,6 +465,7 @@ module GRPC
       # needs the answer before it can decide whether to health-check.
       def resolve_worker
         addresses = Transport.resolve_addresses(@parsed_target, @args)
+        start_resolver_watch_once
         health_check_service_name = effective_health_check_service_name
         outlier_detection_config = effective_service_config&.outlier_detection
         policy = @mu.synchronize do
@@ -470,6 +486,51 @@ module GRPC
         end
       end
 
+      # Registers for a resolver push exactly once per channel: an xds:
+      # target's Transport.watch_addresses subscribes with XdsClient
+      # (which may touch its own request queue/thread); tcp:/unix: get
+      # Transport's no-op handle. Called from #resolve_worker's own
+      # thread, off @mu, for the same reason the lookup above already is
+      # -- only the ivar itself is briefly locked, and #resolve_worker
+      # never runs two at a time (guarded by @resolving), so nothing else
+      # writes @resolver_watch concurrently except #destroy.
+      def start_resolver_watch_once
+        return if @mu.synchronize { !@resolver_watch.nil? || @destroyed }
+        watch = Transport.watch_addresses(@parsed_target, @args) { |addresses| apply_resolver_push(addresses) }
+        @mu.synchronize do
+          if @destroyed
+            watch.cancel
+          else
+            @resolver_watch = watch
+          end
+        end
+      end
+
+      # Called by the handle #start_resolver_watch_once registered,
+      # from whichever thread XdsClient::AdsConnection delivers a
+      # control-plane push on -- never while that connection's own lock
+      # is held (see AdsConnection#handle_response) -- so reconciling
+      # here is as free to poke a Subchannel as #maybe_start_connect
+      # already is, off @mu. A push that arrives before the first
+      # #resolve_worker has built @subchannels, or after #destroy, is
+      # dropped: the former's own resolve is still in flight and will
+      # pick up a fresher state itself, and the latter has nothing left
+      # to reconcile into.
+      def apply_resolver_push(addresses)
+        health_check_service_name = effective_health_check_service_name
+        outlier_detection_config = effective_service_config&.outlier_detection
+        policy, stale, stale_timer = @mu.synchronize do
+          next [nil, nil, nil] if @destroyed || @subchannels.nil?
+          stale, stale_timer = reconcile_subchannels_locked(addresses, health_check_service_name, outlier_detection_config)
+          [@lb_policy, stale, stale_timer]
+        end
+        return if policy.nil?
+        stop_outlier_detection_timer(stale_timer)
+        stale.each(&:close)
+        policy.maybe_connect
+        @mu.synchronize { transition_locked(policy.connectivity_state) unless @destroyed }
+      end
+
       # grpc.inhibit_health_checking turns the feature off outright;
       # otherwise the applicable service config's healthCheckConfig names
       # the service to watch, or nil for none, exactly as
@@ -480,14 +541,58 @@ module GRPC
         effective_service_config&.health_check_config&.service_name
       end
 
+      # The very first resolve for this channel: every address is new, so
+      # every Subchannel is too.
+      def build_subchannels_locked(addresses, health_check_service_name, config)
+        @subchannels = addresses.map { |address| new_subchannel(address, health_check_service_name) }
+        install_lb_policy_locked(config)
+      end
+
+      # Called with @mu held to fold a resolver push into the live
+      # subchannel set -- unlike #build_subchannels_locked (the very
+      # first resolve, and the full teardown/rebuild
+      # #schedule_reresolve_locked does after every address has failed),
+      # this keeps the Subchannel for every address still named, so a
+      # working connection is never dropped and no in-flight RPC on it is
+      # disturbed, and only closes the ones whose address disappeared.
+      # @lb_policy is always rebuilt fresh even though its class may be
+      # unchanged: ring_hash and weighted_round_robin bake their
+      # ring/weight schedule into the constructor from the subchannel
+      # list they are handed, so #install_lb_policy_locked is already the
+      # cheapest way to fold in a changed set. The stale subchannels and
+      # any outlier-detection timer they leave behind are returned rather
+      # than closed/stopped here -- neither may be touched while @mu is
+      # held, exactly like #schedule_reresolve_locked's own teardown.
+      def reconcile_subchannels_locked(addresses, health_check_service_name, config)
+        by_key = @subchannels.each_with_object({}) { |sc, h| h[address_key(sc.address)] = sc }
+        @subchannels = addresses.map do |address|
+          by_key.delete(address_key(address)) || new_subchannel(address, health_check_service_name)
+        end
+        stale = by_key.values
+        stale_timer = @outlier_detection_timer
+        @outlier_detection_timer = nil
+        install_lb_policy_locked(config)
+        [stale, stale_timer]
+      end
+
+      # The identity a Subchannel is kept or dropped by across a push:
+      # scheme/host/port/path, not #weight or #lrs_counter, which an EDS
+      # rebalance can change for the very same physical endpoint without
+      # that endpoint's connection needing to be torn down and redialed.
+      def address_key(address)
+        [address.scheme, address.host, address.port, address.path]
+      end
+
       # Wraps the child LB_POLICIES entry in an OutlierDetectionPolicy, and
       # starts the one timer that drives it, exactly when +config+ is
       # non-nil -- i.e. the applicable service config carried an
-      # outlierDetection object. A prior epoch's timer is always already
-      # stopped by whichever of #destroy/#schedule_reresolve_locked tore
-      # its subchannels down, so @outlier_detection_timer is nil here.
-      def build_subchannels_locked(addresses, health_check_service_name, config)
-        @subchannels = addresses.map { |address| new_subchannel(address, health_check_service_name) }
+      # outlierDetection object. Called with @mu held and
+      # @outlier_detection_timer already nil: #build_subchannels_locked's
+      # caller never set one, and #reconcile_subchannels_locked's own
+      # caller clears it (returning the prior epoch's timer for the
+      # caller to stop off @mu, since neither may be touched while it is
+      # held) before calling here.
+      def install_lb_policy_locked(config)
         child = LB_POLICIES.fetch(@lb_policy_name).new(@subchannels, @args)
         if config.nil?
           @lb_policy = child

@@ -76,6 +76,11 @@ module GRPC
           @nonces = Hash.new('')
           # Per resource type: name => decoded message last accepted.
           @resources = Hash.new { |h, k| h[k] = {} }
+          # Per listener name: watch id => callback (see #watch_endpoints),
+          # and the addresses last delivered to it, so a response that
+          # leaves #endpoints_for_locked unchanged does not re-notify.
+          @watchers = Hash.new { |h, k| h[k] = {} }
+          @watch_last = {}
 
           # The chain a listener name resolves through, filled in as each
           # link's response arrives.
@@ -125,6 +130,24 @@ module GRPC
               @cv.wait(@mu, [remaining, 0.05].min)
             end
           end
+        end
+
+        # Registers +block+ to be called, from whichever thread is
+        # handling the response (see #handle_response), with a fresh
+        # Array<Transport::Target> every time a later ADS response changes
+        # +listener_name+'s resolved endpoints. Returns an id
+        # #unwatch_endpoints needs to cancel it; safe to call more than
+        # once for the same +listener_name+.
+        def watch_endpoints(listener_name, &block)
+          subscribe(TYPE_LISTENER, listener_name)
+          id = Object.new
+          @mu.synchronize { @watchers[listener_name][id] = block }
+          id
+        end
+
+        def unwatch_endpoints(listener_name, id)
+          @mu.synchronize { @watchers[listener_name].delete(id) }
+          nil
         end
 
         def close
@@ -206,19 +229,42 @@ module GRPC
         def handle_response(response)
           type_url = response.type_url
           decoded = decode_resources(type_url, response.resources)
-          @mu.synchronize do
+          notifications = @mu.synchronize do
             @nonces[type_url] = response.nonce
             apply_locked(type_url, decoded)
             @versions[type_url] = response.version_info
             send_request_locked(type_url)
             @cv.broadcast
+            pending_notifications_locked
           end
+          # Off @mu: a watcher (Channel#apply_resolver_push) pokes a
+          # Subchannel, and this connection's lock must never be held
+          # while that happens, mirroring the rule Channel itself follows
+          # for its own lock in #maybe_start_connect.
+          notifications.each { |block, addresses| block.call(addresses) }
         rescue DecodeError => e
           @mu.synchronize do
             @nonces[type_url] = response.nonce
             status = Google::Rpc::Status.new(code: StatusCodes::INVALID_ARGUMENT, message: e.message)
             send_request_locked(type_url, error_detail: status)
           end
+        end
+
+        # Every watched listener name whose #endpoints_for_locked answer
+        # just changed, paired with the addresses to deliver to each of
+        # its callbacks. Computed under @mu -- #endpoints_for_locked reads
+        # the tables #apply_locked just wrote -- but returned rather than
+        # invoked, so the caller can call back off this connection's lock.
+        def pending_notifications_locked
+          pairs = []
+          @watchers.each do |listener_name, callbacks|
+            next if callbacks.empty?
+            addresses = endpoints_for_locked(listener_name)
+            next if addresses.nil? || addresses == @watch_last[listener_name]
+            @watch_last[listener_name] = addresses
+            callbacks.each_value { |block| pairs << [block, addresses] }
+          end
+          pairs
         end
 
         def decode_resources(type_url, anys)

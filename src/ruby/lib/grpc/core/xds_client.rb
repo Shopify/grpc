@@ -68,6 +68,16 @@ module GRPC
       TYPE_CLUSTER = 'type.googleapis.com/envoy.config.cluster.v3.Cluster'
       TYPE_ENDPOINT = 'type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment'
 
+      # Returned by #watch_endpoints. +cancel+ drops the subscription so a
+      # destroyed Channel's callback is never invoked again; safe to call
+      # more than once.
+      Watch = Struct.new(:connection, :listener_name, :id) do
+        def cancel
+          connection.unwatch_endpoints(listener_name, id)
+          nil
+        end
+      end
+
       DEFAULT_RESOLVE_TIMEOUT = 10
 
       class << self
@@ -121,6 +131,19 @@ module GRPC
       def resolve_endpoints(listener_name, authority: nil, timeout: DEFAULT_RESOLVE_TIMEOUT)
         connection, resolved_name = route_for(listener_name, authority)
         connection.resolve_endpoints(resolved_name, timeout: timeout)
+      end
+
+      # Registers +block+ to be called with a fresh
+      # Array<Transport::Target> every time a later control-plane push
+      # changes +listener_name+'s resolved endpoints -- #resolve_endpoints's
+      # initial pull is not repeated here. Routing mirrors
+      # #resolve_endpoints so a federated authority watches the same
+      # management server it would have resolved against.
+      #
+      # @return [Watch]
+      def watch_endpoints(listener_name, authority: nil, &block)
+        connection, resolved_name = route_for(listener_name, authority)
+        Watch.new(connection, resolved_name, connection.watch_endpoints(resolved_name, &block))
       end
 
       def close
