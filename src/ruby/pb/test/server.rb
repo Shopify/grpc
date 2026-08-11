@@ -135,6 +135,27 @@ def maybe_echo_status_and_message(req)
   end
 end
 
+# Enforces SimpleRequest/StreamingInputCallRequest#expect_compressed: a
+# BoolValue of true requires the message that was just read to have arrived
+# compressed on the wire, false requires it to have arrived uncompressed.
+# Unset (nil) means the client isn't opting into the check, per
+# doc/interop-test-descriptions.md's CompressedRequest section.
+def check_expect_compressed!(expect_compressed, actual_compressed)
+  return if expect_compressed.nil?
+  return if expect_compressed.value == actual_compressed
+  fail GRPC::BadStatus.new_status_exception(
+      GRPC::Core::StatusCodes::INVALID_ARGUMENT,
+      'Compressed request expectation not met.')
+end
+
+# Honours SimpleRequest#response_compressed by asking the call to send its
+# response gzip-compressed, or explicitly uncompressed. Unset (nil) leaves
+# the call's default (uncompressed) alone.
+def maybe_set_response_compression(call, response_compressed)
+  return if response_compressed.nil?
+  call.send_encoding = response_compressed.value ? 'gzip' : 'identity'
+end
+
 # A FullDuplexEnumerator passes requests to a block and yields generated responses
 class FullDuplexEnumerator
   include Grpc::Testing
@@ -179,13 +200,18 @@ class TestTarget < Grpc::Testing::TestService::Service
   def unary_call(simple_req, _call)
     maybe_echo_metadata(_call)
     maybe_echo_status_and_message(simple_req)
+    check_expect_compressed!(simple_req.expect_compressed, _call.message_compressed)
+    maybe_set_response_compression(_call, simple_req.response_compressed)
     req_size = simple_req.response_size
     SimpleResponse.new(payload: Payload.new(type: :COMPRESSABLE,
                                             body: nulls(req_size)))
   end
 
   def streaming_input_call(call)
-    sizes = call.each_remote_read.map { |x| x.payload.body.length }
+    sizes = call.each_remote_read.map do |x|
+      check_expect_compressed!(x.expect_compressed, call.message_compressed)
+      x.payload.body.length
+    end
     sum = sizes.inject(0) { |s, x| s + x }
     StreamingInputCallResponse.new(aggregated_payload_size: sum)
   end
@@ -249,4 +275,7 @@ def main
   s.run_till_terminated
 end
 
-main
+# Guarded so the interop compression spec can require this file (to reuse
+# TestTarget and the compression helpers above) without spawning a server,
+# matching client.rb's own __FILE__ == $0 guard.
+main if __FILE__ == $0

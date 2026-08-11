@@ -50,7 +50,8 @@ module GRPC
     extend Forwardable
     attr_reader :deadline, :metadata_sent, :metadata_to_send, :peer, :peer_cert
     def_delegators :@call, :cancel, :cancel_with_status, :metadata,
-                   :write_flag, :write_flag=, :trailing_metadata, :status
+                   :write_flag, :write_flag=, :trailing_metadata, :status,
+                   :message_compressed, :send_encoding=
 
     # client_invoke begins a client invocation.
     #
@@ -670,7 +671,8 @@ module GRPC
                                :send_initial_metadata,
                                :metadata_to_send,
                                :merge_metadata_to_send,
-                               :metadata_sent)
+                               :metadata_sent,
+                               :message_compressed, :send_encoding=)
 
     # MultiReqView limits access to an ActiveCall's methods for use in
     # server client_streamer handlers.
@@ -680,7 +682,8 @@ module GRPC
                               :send_initial_metadata,
                               :metadata_to_send,
                               :merge_metadata_to_send,
-                              :metadata_sent)
+                              :metadata_sent,
+                              :message_compressed, :send_encoding=)
 
     # Operation limits access to an ActiveCall's methods for use as
     # a Operation on the client.

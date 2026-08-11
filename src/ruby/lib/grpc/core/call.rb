@@ -59,7 +59,14 @@ module GRPC
         table.freeze
       end
 
-      attr_reader :metadata, :trailing_metadata, :status, :write_flag
+      attr_reader :metadata, :trailing_metadata, :status, :write_flag,
+                  :message_compressed
+      # Lets a server handler ask for its response to be sent compressed
+      # (SimpleRequest#response_compressed in the interop test protocol).
+      # Mirrors how a client channel's grpc.default_compression_algorithm
+      # reaches #start_client_call via @send_encoding; #send_server_headers
+      # is the equivalent point on the server side.
+      attr_writer :send_encoding
 
       # Builds the client side of a call. Internal; use Channel#create_call.
       def self.client(channel:, method:, host:, deadline:, parent:, mask:)
@@ -240,6 +247,7 @@ module GRPC
         @trailing_metadata = nil
         @call_credentials = nil
         @send_encoding = 'identity'
+        @message_compressed = false
         @initial_metadata_received = false
         @start_attempted = false
         @monotonic_deadline = monotonic_deadline_for(@deadline)
@@ -393,6 +401,7 @@ module GRPC
         ensure_started
         return if failed?
         result.message = @stream.read_message(@monotonic_deadline)
+        @message_compressed = @stream.last_message_compressed
       rescue RpcStream::ResourceExhausted => e
         record_status(StatusCodes::RESOURCE_EXHAUSTED, e.message)
         result.message = nil
@@ -551,6 +560,8 @@ module GRPC
           [':status', '200'],
           ['content-type', 'application/grpc']
         ]
+        headers << ['grpc-encoding', @send_encoding] if @send_encoding != 'identity'
+        @stream.send_encoding = @send_encoding
         headers.concat(Metadata.encode(metadata))
         @headers_sent = true
         @stream.send_headers(headers)

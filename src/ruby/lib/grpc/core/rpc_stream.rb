@@ -73,6 +73,13 @@ module GRPC
 
       attr_reader :id, :connection
       attr_accessor :peer, :peer_cert, :recv_encoding, :send_encoding
+      # Compression bit of the most recently read message's length-prefix
+      # frame header (RFC "Compressed-Flag"), for handlers that must verify
+      # what the peer actually sent -- e.g. the interop test server's
+      # CompressedRequest checks. Set alongside the existing read in
+      # #read_message, so it costs nothing beyond the boolean already being
+      # computed there.
+      attr_reader :last_message_compressed
 
       def initialize(connection, id, max_receive_message_length:,
                      max_send_message_length: NO_LIMIT)
@@ -95,6 +102,7 @@ module GRPC
         @local_closed = false
         @recv_encoding = 'identity'
         @send_encoding = 'identity'
+        @last_message_compressed = false
         @write_mu = Mutex.new
         @write_cv = ConditionVariable.new
         @queued_bytes = 0
@@ -231,6 +239,7 @@ module GRPC
         @mu.synchronize do
           return nil unless await_bytes(FRAME_HEADER_SIZE, deadline)
           compressed = @buffer.getbyte(@read_pos) == 1
+          @last_message_compressed = compressed
           length = @buffer.unpack1('N', offset: @read_pos + 1)
           advance(FRAME_HEADER_SIZE)
         end

@@ -922,6 +922,7 @@ Metrics/ClassLength:
     - 'lib/grpc/core/server.rb'
     - 'lib/grpc/core/xds_client.rb'
     - 'lib/grpc/core/xds_ads_connection.rb'
+    - 'lib/grpc/core/rpc_stream.rb'
     - 'lib/grpc/generic/client_stub.rb'
 
 # Offense count: 2
