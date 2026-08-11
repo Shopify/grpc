@@ -47,21 +47,25 @@ module GRPC
       HTTP2_MAX_PINGS_WITHOUT_DATA = 'grpc.http2.max_pings_without_data'
       HTTP2_MIN_TIME_BETWEEN_PINGS_MS = 'grpc.http2.min_time_between_pings_ms'
       HTTP2_MAX_PING_STRIKES = 'grpc.http2.max_ping_strikes'
+      INHIBIT_HEALTH_CHECKING = 'grpc.inhibit_health_checking'
       INITIAL_RECONNECT_BACKOFF_MS = 'grpc.initial_reconnect_backoff_ms'
       MIN_RECONNECT_BACKOFF_MS = 'grpc.min_reconnect_backoff_ms'
       MAX_RECONNECT_BACKOFF_MS = 'grpc.max_reconnect_backoff_ms'
       PER_MESSAGE_COMPRESSION = 'grpc.per_message_compression'
       DNS_ENABLE_SRV_QUERIES = 'grpc.dns_enable_srv_queries'
       SERVICE_CONFIG_DISABLE_RESOLUTION = 'grpc.service_config_disable_resolution'
+      SERVICE_CONFIG = 'grpc.service_config'
+      ENABLE_RETRIES = 'grpc.enable_retries'
       ABSOLUTE_MAX_METADATA_SIZE = 'grpc.absolute_max_metadata_size'
       PER_RPC_RETRY_BUFFER_SIZE = 'grpc.per_rpc_retry_buffer_size'
       EXPERIMENTAL_ENABLE_HEDGING = 'grpc.experimental.enable_hedging'
       HTTP_PROXY = 'grpc.http_proxy'
       ADDRESS_HTTP_PROXY = 'grpc.address_http_proxy'
-      INHIBIT_HEALTH_CHECKING = 'grpc.inhibit_health_checking'
       RING_HASH_LB_RING_SIZE_CAP = 'grpc.lb.ring_hash.ring_size_cap'
-      SERVICE_CONFIG = 'grpc.service_config'
-      ENABLE_RETRIES = 'grpc.enable_retries'
+      HTTP2_BDP_PROBE = 'grpc.http2.bdp_probe'
+      HTTP2_LOOKAHEAD_BYTES = 'grpc.http2.lookahead_bytes'
+      HTTP2_MAX_FRAME_SIZE = 'grpc.http2.max_frame_size'
+      HTTP2_WRITE_BUFFER_SIZE = 'grpc.http2.write_buffer_size'
 
       # Every argument in the "grpc." namespace that this implementation
       # actually acts on. Anything else in that namespace is a gRPC argument
@@ -81,9 +85,13 @@ module GRPC
         ENABLE_HTTP_PROXY,
         ENABLE_RETRIES,
         EXPERIMENTAL_ENABLE_HEDGING,
+        HTTP2_BDP_PROBE,
+        HTTP2_LOOKAHEAD_BYTES,
+        HTTP2_MAX_FRAME_SIZE,
         HTTP2_MAX_PING_STRIKES,
         HTTP2_MAX_PINGS_WITHOUT_DATA,
         HTTP2_MIN_TIME_BETWEEN_PINGS_MS,
+        HTTP2_WRITE_BUFFER_SIZE,
         HTTP_PROXY,
         INHIBIT_HEALTH_CHECKING,
         INITIAL_RECONNECT_BACKOFF_MS,
@@ -120,7 +128,7 @@ module GRPC
       # gRPC's own default cap on received metadata.
       DEFAULT_MAX_METADATA_SIZE = 8 * 1024
 
-      # gRPC's own default cap on what a retry may hold for replay.
+      # gRPC's own default cap on requests buffered per RPC for retry replay.
       DEFAULT_PER_RPC_RETRY_BUFFER_SIZE = 256 * 1024
 
       module_function

@@ -54,18 +54,22 @@ module GRPC
       DEFAULT_MAX_PINGS_WITHOUT_DATA = 2
       DEFAULT_MAX_PING_STRIKES = 2
 
+      # grpc.http2.lookahead_bytes: C-core's own default. Session already
+      # advertises a receive window far above this, so it only matters when
+      # a caller raises it past that floor to unlock more BDP-driven growth.
+      DEFAULT_LOOKAHEAD_BYTES = 65_536
+
       # How often the maintenance timer wakes to re-check every deadline
       # (keepalive, idle, age). Finer than any one interval so several
       # features sharing the thread do not lose precision to each other.
       MAINTENANCE_POLL_INTERVAL = 0.005
 
+      attr_reader :session, :peer, :peer_cert
       # Set by Subchannel#connect_worker right after a successful dial, to
       # whatever CallCounter OutlierDetectionPolicy gave that address (nil
       # when outlier detection is not configured). Call#op_recv_status bumps
       # it once per finished client RPC; nothing else touches it.
       attr_accessor :outlier_counter
-
-      attr_reader :session, :peer, :peer_cert
 
       # rubocop:disable Metrics/ParameterLists -- all but +io+ are keywords
       def initialize(io, peer:, client:, max_receive_message_length:,
@@ -78,6 +82,8 @@ module GRPC
                      max_pings_without_data: DEFAULT_MAX_PINGS_WITHOUT_DATA,
                      min_time_between_pings: nil,
                      max_ping_strikes: DEFAULT_MAX_PING_STRIKES,
+                     bdp_probe: true, lookahead_bytes: nil, max_frame_size: nil,
+                     write_buffer_size: nil,
                      on_new_rpc: nil, on_close: nil)
         super()
         @io = io
@@ -128,7 +134,9 @@ module GRPC
         @handshake_cv = ConditionVariable.new
         @session = Http2::Kantan::H2::Session.new(
           io, handler: self, max_concurrent_streams: max_concurrent_streams,
-              max_ping_strikes: max_ping_strikes)
+              max_ping_strikes: max_ping_strikes, bdp_probe: bdp_probe,
+              lookahead_bytes: lookahead_bytes, max_frame_size: max_frame_size,
+              write_buffer_size: write_buffer_size)
       end
       # rubocop:enable Metrics/ParameterLists
 

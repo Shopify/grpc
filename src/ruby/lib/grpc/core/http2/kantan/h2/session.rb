@@ -262,7 +262,9 @@ module Kantan
 
       # grpc: max_concurrent_streams is configurable so that a gRPC server can
       # honour grpc.max_concurrent_streams from its channel args.
-      def initialize io, handler:, max_concurrent_streams: 100, max_ping_strikes: 2
+      def initialize io, handler:, max_concurrent_streams: 100, max_ping_strikes: 2,
+                      bdp_probe: true, lookahead_bytes: nil, max_frame_size: nil,
+                      write_buffer_size: nil
         @name = SecureRandom.uuid
         @io = io
         @handler = handler
@@ -323,6 +325,53 @@ module Kantan
         # without either of them costing a per-message allocation.
         @data_frames_sent = 0
         @data_frames_sent_at_last_ping_strike_check = 0
+
+        # grpc.http2.max_frame_size: advertised in our own SETTINGS instead of
+        # only enforced on read, so a peer that honours SETTINGS can actually
+        # send us the larger frames. nil (the common case) keeps the frozen
+        # DEFAULT_ENCODED blob instead of allocating a settings frame nobody
+        # asked to change.
+        @max_inbound_frame_size = max_frame_size || Frames::Settings::MAX_INBOUND_FRAME_SIZE
+        if max_frame_size
+          # RFC 7540 6.5.2: SETTINGS_MAX_FRAME_SIZE must fall within
+          # [2^14, 2^24-1]; a value outside that range would desynchronise
+          # any peer that enforces it.
+          if max_frame_size < 16_384 || max_frame_size > 16_777_215
+            fail ArgumentError,
+                 "grpc.http2.max_frame_size #{max_frame_size} is outside " \
+                 "the RFC 7540 range 16384..16777215"
+          end
+          settings = Frames::Settings::DEFAULT.dup
+          settings.max_frame_size = max_frame_size
+          @advertised_settings = settings.encode(0)
+        else
+          @advertised_settings = Frames::Settings::DEFAULT_ENCODED
+        end
+
+        # grpc.http2.write_buffer_size: how large the write thread lets its
+        # buffer grow before flushing, in place of the WRITE_BUFFER_SIZE
+        # constant every other Session used.
+        @write_buffer_size = write_buffer_size || WRITE_BUFFER_SIZE
+
+        # grpc.http2.bdp_probe and grpc.http2.lookahead_bytes: periodically
+        # PINGs the peer and measures bytes received before the ACK to
+        # estimate the bandwidth-delay product, then grows the connection and
+        # active streams' receive windows toward it. @bdp_window_target tracks
+        # what has already been granted; growth is monotonic within a
+        # connection's life, capped at @bdp_window_ceiling. lookahead_bytes
+        # only ever raises that ceiling -- RECEIVE_WINDOW is itself already
+        # far above HTTP/2's 64 KiB default, tuned for the 64 KiB messages
+        # gRPC moves routinely, so a lookahead_bytes smaller than that (its
+        # own default is 64 KiB) must not shrink what is already granted.
+        @bdp_probe_enabled = bdp_probe
+        @bdp_window_target = RECEIVE_WINDOW
+        @bdp_window_ceiling = [RECEIVE_WINDOW, lookahead_bytes || 0].max
+        @bdp_probe_pending = false
+        @bdp_probe_bytes_at_start = 0
+        # grpc: total payload bytes ever received on the connection, the
+        # bandwidth side of the bandwidth-delay-product estimate. Never
+        # reset, unlike @connection_unacked which drains on every acked block.
+        @total_bytes_received = 0
       end
 
       # grpc: one place that knows the Stream layout, and the only place that
@@ -421,7 +470,7 @@ module Kantan
       def connect
         @server_mode = false
         @io.write CONNECTION_PREFACE
-        @io.write Frames::Settings::DEFAULT_ENCODED
+        @io.write @advertised_settings
         @io.write CONNECTION_WINDOW_BUMP
         start_write_thread
         start_read_thread
@@ -437,7 +486,7 @@ module Kantan
             return
           end
         end
-        @io.write Frames::Settings::DEFAULT_ENCODED
+        @io.write @advertised_settings
         @io.write CONNECTION_WINDOW_BUMP
         start_write_thread
         start_read_thread
@@ -449,6 +498,54 @@ module Kantan
       end
 
       private
+
+      # grpc.http2.bdp_probe: tags the PING payload's top bit so #handle_ping
+      # can tell a probe's own ACK apart from a keepalive ACK without a
+      # second channel back to Connection. CLOCK_MONOTONIC nanoseconds do not
+      # reach bit 63 in any process's lifetime, so the timestamp underneath
+      # is unambiguous once the tag is stripped.
+      BDP_PING_FLAG = 1 << 63
+
+      # grpc: only one probe in flight at a time, kicked off from the same
+      # place #credit_connection_window already returns window in blocks --
+      # piggy-backing on that threshold means a probe fires roughly once per
+      # window's worth of inbound data, never per frame, and only while data
+      # is actually arriving. This is deliberately not Connection's
+      # keepalive PING: it never touches @pings_without_data or
+      # @ping_deadline, so grpc.http2.max_pings_without_data cannot throttle
+      # it and it cannot mask a real keepalive timeout.
+      def maybe_start_bdp_probe
+        return unless @bdp_probe_enabled
+        return if @bdp_probe_pending || @bdp_window_target >= @bdp_window_ceiling
+        @bdp_probe_pending = true
+        @bdp_probe_bytes_at_start = @total_bytes_received
+        ts = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) | BDP_PING_FLAG
+        @write_queue << [:ping, [ts].pack("Q>")]
+      end
+
+      # grpc: the bytes received during one round trip are this round's
+      # bandwidth-delay-product estimate. Only grows the target, and only up
+      # to @bdp_window_ceiling; a quiet round trip must not shrink a window
+      # a busier one already earned.
+      def apply_bdp_growth
+        @bdp_probe_pending = false
+        estimate = @total_bytes_received - @bdp_probe_bytes_at_start
+        target = [[@bdp_window_target, estimate].max, @bdp_window_ceiling].min
+        growth = target - @bdp_window_target
+        return unless growth.positive?
+        @bdp_window_target = target
+        # grpc: a stream in this state still has the peer able to send it
+        # more, so it is the set that actually benefits from more window.
+        receiving = @streams.values.select { |s| !s.closed? && !s.idle? && !s.half_closed_remote? }
+        if receiving.empty?
+          @write_queue << [:send_window_update, 0, growth, 0]
+        else
+          receiving.each_with_index do |stream, i|
+            @write_queue << [:send_window_update, stream.id, i.zero? ? growth : 0, growth]
+          end
+        end
+      end
+
 
       def validate_headers headers, stream_id, is_trailer
         # Track pseudo-headers and regular headers
@@ -517,7 +614,7 @@ module Kantan
       end
 
       def write_loop io
-        wbuf = String.new(encoding: Encoding::BINARY, capacity: WRITE_BUFFER_SIZE)
+        wbuf = String.new(encoding: Encoding::BINARY, capacity: @write_buffer_size)
 
         while true
           # grpc: flush before blocking on the queue, not only after handling a
@@ -723,7 +820,7 @@ module Kantan
 
           # Flush a large buffer straight away; the drained case is handled at
           # the top of the loop, where +next+ cannot skip it.
-          if wbuf.bytesize >= WRITE_BUFFER_SIZE
+          if wbuf.bytesize >= @write_buffer_size
             io.write wbuf
             wbuf.clear
           end
@@ -880,7 +977,7 @@ module Kantan
             # applies to every frame type. SETTINGS used to be exempt, which
             # let a peer hand the read thread an arbitrarily long frame to
             # parse; RFC 7540 4.2 gives it no such exemption.
-            if len > Frames::Settings::MAX_INBOUND_FRAME_SIZE
+            if len > @max_inbound_frame_size
               raise Errors::FrameSizeError.new("Frame too large", 0)
             end
 
@@ -1019,6 +1116,7 @@ module Kantan
         # and a frame that carried nothing but padding would return nothing.
         if len.positive?
           @connection_unacked += len
+          @total_bytes_received += len
           stream.unacked += len
           # A stream the peer has just ended does not need its window back.
           ends_stream = flags.odd?
@@ -1029,6 +1127,7 @@ module Kantan
                              ends_stream ? 0 : stream.unacked]
             @connection_unacked = 0
             stream.unacked = 0
+            maybe_start_bdp_probe unless ends_stream
           end
         end
 
@@ -1227,10 +1326,15 @@ module Kantan
           check_ping_strikes
           @write_queue << [:ping_ack, io.read(8)]
         else
-          # ACK of our PING: compute RTT
+          # ACK of a PING we sent: the tagged top bit says whether this was
+          # a BDP probe or an ordinary (e.g. keepalive) one.
           sent_at = io.read_uint64
-          rtt_ns = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - sent_at
-          @handler.on_ping rtt_ns
+          if (sent_at & BDP_PING_FLAG).zero?
+            rtt_ns = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - sent_at
+            @handler.on_ping rtt_ns
+          else
+            apply_bdp_growth
+          end
         end
       end
 

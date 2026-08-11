@@ -136,6 +136,12 @@ module GRPC
         @http2_max_ping_strikes = ChannelArgs.int(
           @args, ChannelArgs::HTTP2_MAX_PING_STRIKES,
           Connection::DEFAULT_MAX_PING_STRIKES)
+        @http2_bdp_probe = !ChannelArgs.int(@args, ChannelArgs::HTTP2_BDP_PROBE, 1).zero?
+        @http2_lookahead_bytes = ChannelArgs.int(
+          @args, ChannelArgs::HTTP2_LOOKAHEAD_BYTES,
+          Connection::DEFAULT_LOOKAHEAD_BYTES)
+        @http2_max_frame_size = @args[ChannelArgs::HTTP2_MAX_FRAME_SIZE]
+        @http2_write_buffer_size = @args[ChannelArgs::HTTP2_WRITE_BUFFER_SIZE]
         @per_message_compression = !ChannelArgs.int(
           @args, ChannelArgs::PER_MESSAGE_COMPRESSION, 1
         ).zero?
