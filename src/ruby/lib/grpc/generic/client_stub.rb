@@ -121,6 +121,47 @@ module GRPC
       @interceptors = InterceptorRegistry.new(interceptors)
     end
 
+    # Bounds and tracks what a client-streaming retry has buffered for
+    # replay, per grpc.per_rpc_retry_buffer_size. A long-running
+    # client-streaming call under a retry policy would otherwise hold every
+    # request it ever sent for as long as the call lives; once the buffered
+    # bytes cross the limit, #add commits the RPC - buffering stops, and
+    # whatever was held is dropped immediately rather than trailing along
+    # to the end of the call.
+    #
+    # @api private
+    class RetryReplayBuffer
+      def initialize(limit)
+        @limit = limit
+        @items = []
+        @bytes = 0
+        @committed = false
+      end
+
+      attr_reader :items, :bytes
+
+      def committed?
+        @committed
+      end
+
+      # Buffers +item+, weighing +bytesize+ against the limit, unless
+      # already committed.
+      def add(item, bytesize)
+        return if @committed
+        @bytes += bytesize
+        @bytes > @limit ? release! : (@items << item)
+      end
+
+      # Drops everything held. Once committed there is no going back: a
+      # further #add is a no-op, so a retry can never replay a partial
+      # buffer.
+      def release!
+        @items = []
+        @bytes = 0
+        @committed = true
+      end
+    end
+
     # Closes the channel this stub opened for itself. A stub built with
     # :channel_override does not own that channel and leaves it alone; the
     # caller who supplied it is responsible for closing it.
@@ -605,11 +646,11 @@ module GRPC
     def client_streamer_with_retries(method, requests, marshal, unmarshal, first_call,
                                      metadata, retry_policy, parent:, credentials:)
       deadline = first_call.deadline
-      buffered = []
+      buffer = RetryReplayBuffer.new(@ch.per_rpc_retry_buffer_size)
       done_buffering = false
       tracked = Enumerator.new do |y|
         requests.each do |r|
-          buffered << r
+          buffer.add(r, marshal.call(r).bytesize)
           y << r
         end
         done_buffering = true
@@ -621,13 +662,14 @@ module GRPC
         call.client_streamer(stream, metadata: attempt_metadata(metadata, attempt))
       rescue GRPC::BadStatus => e
         raise e if attempt == 1 && !done_buffering
+        raise e if buffer.committed?
         backoff = attempt < retry_policy.max_attempts ? retry_backoff(e, retry_policy, attempt, deadline) : nil
         raise e if backoff.nil?
         sleep(backoff)
         attempt += 1
         call = new_active_call(method, marshal, unmarshal,
                                deadline: deadline, parent: parent, credentials: credentials)
-        stream = buffered
+        stream = buffer.items
         retry
       end
     end

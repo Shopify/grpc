@@ -53,6 +53,11 @@ module GRPC
       PER_MESSAGE_COMPRESSION = 'grpc.per_message_compression'
       DNS_ENABLE_SRV_QUERIES = 'grpc.dns_enable_srv_queries'
       SERVICE_CONFIG_DISABLE_RESOLUTION = 'grpc.service_config_disable_resolution'
+      ABSOLUTE_MAX_METADATA_SIZE = 'grpc.absolute_max_metadata_size'
+      PER_RPC_RETRY_BUFFER_SIZE = 'grpc.per_rpc_retry_buffer_size'
+      EXPERIMENTAL_ENABLE_HEDGING = 'grpc.experimental.enable_hedging'
+      HTTP_PROXY = 'grpc.http_proxy'
+      ADDRESS_HTTP_PROXY = 'grpc.address_http_proxy'
       SERVICE_CONFIG = 'grpc.service_config'
       ENABLE_RETRIES = 'grpc.enable_retries'
 
@@ -63,6 +68,8 @@ module GRPC
       # outside the namespace belong to the caller and are ignored, which is
       # what the C extension did with them.
       HONOURED = [
+        ABSOLUTE_MAX_METADATA_SIZE,
+        ADDRESS_HTTP_PROXY,
         CLIENT_IDLE_TIMEOUT_MS,
         COMPRESSION_ENABLED_ALGORITHMS_BITSET,
         DEFAULT_AUTHORITY,
@@ -71,9 +78,11 @@ module GRPC
         DNS_ENABLE_SRV_QUERIES,
         ENABLE_HTTP_PROXY,
         ENABLE_RETRIES,
+        EXPERIMENTAL_ENABLE_HEDGING,
         HTTP2_MAX_PING_STRIKES,
         HTTP2_MAX_PINGS_WITHOUT_DATA,
         HTTP2_MIN_TIME_BETWEEN_PINGS_MS,
+        HTTP_PROXY,
         INITIAL_RECONNECT_BACKOFF_MS,
         KEEPALIVE_PERMIT_WITHOUT_CALLS,
         KEEPALIVE_TIME_MS,
@@ -89,6 +98,7 @@ module GRPC
         MAX_SEND_MESSAGE_LENGTH,
         MIN_RECONNECT_BACKOFF_MS,
         PER_MESSAGE_COMPRESSION,
+        PER_RPC_RETRY_BUFFER_SIZE,
         PRIMARY_USER_AGENT,
         SECONDARY_USER_AGENT,
         SERVICE_CONFIG,
@@ -105,6 +115,9 @@ module GRPC
 
       # gRPC's own default cap on received metadata.
       DEFAULT_MAX_METADATA_SIZE = 8 * 1024
+
+      # gRPC's own default cap on what a retry may hold for replay.
+      DEFAULT_PER_RPC_RETRY_BUFFER_SIZE = 256 * 1024
 
       module_function
 

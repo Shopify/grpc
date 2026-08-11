@@ -385,7 +385,8 @@ module GRPC
       # here.
       def check_received_metadata_size!(pairs)
         return if @channel.nil?
-        Metadata.check_size!(pairs, @channel.max_metadata_size)
+        Metadata.check_size!(pairs, @channel.max_metadata_size,
+                             @channel.absolute_max_metadata_size)
       end
 
       def op_recv_message(result)

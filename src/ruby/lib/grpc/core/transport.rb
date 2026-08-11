@@ -253,17 +253,28 @@ module GRPC
       end
 
       # Picks the proxy to tunnel through, honouring grpc.enable_http_proxy,
-      # the grpc_proxy/https_proxy/http_proxy environment variables in that
-      # order, and the no_grpc_proxy/no_proxy exclusion list. Returns nil, the
-      # common case, when no proxy applies. Unix targets never proxy, mirroring
-      # C-core.
+      # then grpc.http_proxy and grpc.address_http_proxy, then the
+      # grpc_proxy/https_proxy/http_proxy environment variables, in that
+      # order, and the no_grpc_proxy/no_proxy exclusion list. A channel
+      # argument always beats the environment, matching gRPC's own
+      # precedence for these two args. Returns nil, the common case, when no
+      # proxy applies. Unix targets never proxy, mirroring C-core.
       def proxy_for(target, args)
         return nil if [:unix, :xds].include?(target.scheme)
         return nil if ChannelArgs.int(args, ChannelArgs::ENABLE_HTTP_PROXY, 1).zero?
-        uri_str = PROXY_ENV_VARS.map { |name| ENV[name] }.find { |v| v && !v.empty? }
-        return nil if uri_str.nil?
-        return nil if no_proxy?(target.host)
+        uri_str = configured_proxy_uri(args)
+        return nil if uri_str.nil? || no_proxy?(target.host)
         parse_proxy_url(uri_str)
+      end
+
+      # A channel argument always beats the environment, and an empty value
+      # counts as unset wherever it came from.
+      def configured_proxy_uri(args)
+        from_args = ChannelArgs.str(args, ChannelArgs::HTTP_PROXY) ||
+                    ChannelArgs.str(args, ChannelArgs::ADDRESS_HTTP_PROXY)
+        candidate = from_args ||
+                    PROXY_ENV_VARS.map { |name| ENV[name] }.find { |v| v && !v.empty? }
+        candidate unless candidate.nil? || candidate.empty?
       end
 
       def no_proxy?(host)

@@ -130,22 +130,29 @@ module GRPC
         pairs.sum { |name, value| name.bytesize + value.bytesize + PAIR_OVERHEAD }
       end
 
-      # Fails with ResourceExhausted when +pairs+ is heavier than +max+,
-      # matching the RESOURCE_EXHAUSTED status gRPC gives a peer whose
-      # headers overflow grpc.max_metadata_size. Only ever applied to
-      # received metadata: the limit protects a peer from what it is handed,
-      # not from what it chooses to send. +max+ of nil means unlimited.
-      def check_size!(pairs, max)
-        return if max.nil?
+      # Fails with ResourceExhausted when +pairs+ is heavier than +absolute+
+      # (defaulting to +max+), matching the RESOURCE_EXHAUSTED status gRPC
+      # gives a peer whose headers overflow the metadata cap. Only ever
+      # applied to received metadata: the limit protects a peer from what it
+      # is handed, not from what it chooses to send. +max+
+      # (grpc.max_metadata_size) is nominally the soft, advisory limit and
+      # +absolute+ (grpc.absolute_max_metadata_size) the hard one gRPC
+      # actually enforces on receive; this core does not implement the
+      # probabilistic rejection C-core applies between the two, so the only
+      # threshold that ever bites is +absolute+, which callers default to
+      # +max+ when the caller set no separate one. Nil means unlimited.
+      def check_size!(pairs, max, absolute = max)
+        return if absolute.nil?
         total = size(pairs)
-        return if total <= max
+        return if total <= absolute
+        arg = absolute == max ? 'grpc.max_metadata_size' : 'grpc.absolute_max_metadata_size'
         fail ResourceExhausted,
-             "Received metadata size exceeds peer limit " \
-             "grpc.max_metadata_size (#{total} vs. #{max})"
+             "Received metadata size exceeds peer limit #{arg} " \
+             "(#{total} vs. #{absolute})"
       end
 
-      # Raised by #check_size! when received metadata is heavier than
-      # grpc.max_metadata_size.
+      # Raised by #check_size! when received metadata is heavier than the
+      # enforced metadata size cap.
       class ResourceExhausted < StandardError; end
     end
   end

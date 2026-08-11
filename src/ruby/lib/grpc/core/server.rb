@@ -71,6 +71,8 @@ module GRPC
         @max_metadata_size = ChannelArgs.int(
           @args, ChannelArgs::MAX_METADATA_SIZE,
           ChannelArgs::DEFAULT_MAX_METADATA_SIZE)
+        @absolute_max_metadata_size = ChannelArgs.int(
+          @args, ChannelArgs::ABSOLUTE_MAX_METADATA_SIZE, @max_metadata_size)
         @max_concurrent_streams = ChannelArgs.int(
           @args, ChannelArgs::MAX_CONCURRENT_STREAMS, 100)
         @so_reuseport = !ChannelArgs.int(@args, ChannelArgs::SO_REUSEPORT, 1).zero?
@@ -318,7 +320,7 @@ module GRPC
       end
 
       def oversized_metadata?(headers)
-        Metadata.size(headers) > @max_metadata_size
+        Metadata.size(headers) > @absolute_max_metadata_size
       end
 
       # The client has already sent its request by the time headers arrive,
@@ -331,12 +333,17 @@ module GRPC
       # through Call#close.
       def reject_oversized_metadata(stream, headers)
         size = Metadata.size(headers)
+        arg = if @absolute_max_metadata_size == @max_metadata_size
+                'grpc.max_metadata_size'
+              else
+                'grpc.absolute_max_metadata_size'
+              end
         stream.send_headers(
           [[':status', '200'], ['content-type', 'application/grpc'],
            ['grpc-status', StatusCodes::RESOURCE_EXHAUSTED.to_s],
            ['grpc-message',
-            "Received metadata size exceeds grpc.max_metadata_size " \
-            "(#{size} vs. #{@max_metadata_size})"]],
+            "Received metadata size exceeds #{arg} " \
+            "(#{size} vs. #{@absolute_max_metadata_size})"]],
           end_stream: true)
         stream.connection.forget(stream.id)
       rescue Http2::Kantan::Errors::Error, IOError, SystemCallError

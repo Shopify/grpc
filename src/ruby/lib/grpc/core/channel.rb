@@ -58,7 +58,8 @@ module GRPC
       end
 
       attr_reader :target, :call_credentials, :default_compression_algorithm,
-                  :max_metadata_size
+                  :max_metadata_size, :absolute_max_metadata_size,
+                  :per_rpc_retry_buffer_size
 
       def initialize(target, channel_args, credentials)
         @target = target
@@ -72,6 +73,7 @@ module GRPC
         @resolved_service_config_looked_up = false
         @service_config_mu = Mutex.new
         @enable_retries_arg = @args[ChannelArgs::ENABLE_RETRIES]
+        @enable_hedging_arg = @args[ChannelArgs::EXPERIMENTAL_ENABLE_HEDGING]
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @state = ConnectivityStates::IDLE
@@ -102,6 +104,11 @@ module GRPC
         @max_metadata_size = ChannelArgs.int(
           @args, ChannelArgs::MAX_METADATA_SIZE,
           ChannelArgs::DEFAULT_MAX_METADATA_SIZE)
+        @absolute_max_metadata_size = ChannelArgs.int(
+          @args, ChannelArgs::ABSOLUTE_MAX_METADATA_SIZE, @max_metadata_size)
+        @per_rpc_retry_buffer_size = ChannelArgs.int(
+          @args, ChannelArgs::PER_RPC_RETRY_BUFFER_SIZE,
+          ChannelArgs::DEFAULT_PER_RPC_RETRY_BUFFER_SIZE)
         @keepalive_time = ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIME_MS)
         @keepalive_timeout =
           ChannelArgs.seconds(@args, ChannelArgs::KEEPALIVE_TIMEOUT_MS) ||
@@ -216,11 +223,18 @@ module GRPC
         !method_config(method)&.retry_policy.nil?
       end
 
-      # Whether hedging is enabled for +method+. Shares grpc.enable_retries's
-      # override with #retries_enabled?: hedging is gRPC's other response to
-      # a failed attempt, and the one flag turns both off together.
+      # Whether hedging is enabled for +method+. grpc.enable_retries's
+      # override still turns both retries and hedging off together, since
+      # hedging is gRPC's other response to a failed attempt; beyond that,
+      # gRPC also requires grpc.experimental.enable_hedging (the flag that
+      # actually turns hedging on) before a hedgingPolicy has any effect.
+      # Neither arg set falls back to the same rule #retries_enabled? uses:
+      # on exactly when the applicable method config carries the policy.
       def hedging_enabled?(method)
+        return false if @enable_retries_arg&.zero?
+        return false if @enable_hedging_arg&.zero?
         return @enable_retries_arg != 0 unless @enable_retries_arg.nil?
+        return @enable_hedging_arg != 0 unless @enable_hedging_arg.nil?
         !method_config(method)&.hedging_policy.nil?
       end
 
