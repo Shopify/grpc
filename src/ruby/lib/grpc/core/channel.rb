@@ -498,10 +498,15 @@ module GRPC
       end
 
       def new_subchannel(address, health_check_service_name)
-        Subchannel.new(address, dial: method(:build_connection_for),
-                                on_state_change: method(:on_subchannel_state_changed),
-                                health_check_service_name: health_check_service_name,
-                                health_backoff_factory: method(:build_backoff))
+        subchannel = Subchannel.new(address, dial: method(:build_connection_for),
+                                             on_state_change: method(:on_subchannel_state_changed),
+                                             health_check_service_name: health_check_service_name,
+                                             health_backoff_factory: method(:build_backoff))
+        # Only an EDS-resolved xds address carries a Target#lrs_counter
+        # (see XdsClient::AdsConnection#target_of); every other resolver
+        # leaves it nil, so this is a no-op for dns:/unix:/plain targets.
+        subchannel.lrs_counter = address.lrs_counter if address.respond_to?(:lrs_counter) && address.lrs_counter
+        subchannel
       end
 
       # Dials +address+, one of the addresses #resolve_addresses returned

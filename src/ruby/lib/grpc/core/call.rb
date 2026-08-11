@@ -411,8 +411,11 @@ module GRPC
         # The only place a client call's outcome is known for every path
         # (trailers, cancellation, transport failure, deadline): see
         # OutlierDetection::CallCounter for why this is a bare integer bump
-        # with no lock.
-        @connection&.outlier_counter&.record(result.status.code == StatusCodes::OK)
+        # with no lock. XdsClient::LrsCallCounter#record_finished follows
+        # the same trade, for the same reason.
+        succeeded = result.status.code == StatusCodes::OK
+        @connection&.outlier_counter&.record(succeeded)
+        @connection&.lrs_counter&.record_finished(succeeded)
         @finished = true
       end
 
@@ -446,6 +449,7 @@ module GRPC
         begin
           @stream = @channel.open_stream(deadline: @monotonic_deadline, hash_key: hash_key)
           @connection = @stream.connection
+          @connection.lrs_counter&.record_issued
           @peer = @stream.peer
           @peer_cert = @stream.peer_cert
           @stream.send_encoding = @send_encoding

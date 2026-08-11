@@ -48,9 +48,6 @@ module GRPC
       HTTP2_MIN_TIME_BETWEEN_PINGS_MS = 'grpc.http2.min_time_between_pings_ms'
       HTTP2_MAX_PING_STRIKES = 'grpc.http2.max_ping_strikes'
       INHIBIT_HEALTH_CHECKING = 'grpc.inhibit_health_checking'
-      EXPAND_WILDCARD_ADDRS = 'grpc.expand_wildcard_addrs'
-      SERVER_HANDSHAKE_TIMEOUT_MS = 'grpc.server_handshake_timeout_ms'
-      SERVER_MAX_PENDING_REQUESTS = 'grpc.server.max_pending_requests'
       INITIAL_RECONNECT_BACKOFF_MS = 'grpc.initial_reconnect_backoff_ms'
       MIN_RECONNECT_BACKOFF_MS = 'grpc.min_reconnect_backoff_ms'
       MAX_RECONNECT_BACKOFF_MS = 'grpc.max_reconnect_backoff_ms'
@@ -69,6 +66,9 @@ module GRPC
       HTTP2_LOOKAHEAD_BYTES = 'grpc.http2.lookahead_bytes'
       HTTP2_MAX_FRAME_SIZE = 'grpc.http2.max_frame_size'
       HTTP2_WRITE_BUFFER_SIZE = 'grpc.http2.write_buffer_size'
+      EXPAND_WILDCARD_ADDRS = 'grpc.expand_wildcard_addrs'
+      SERVER_HANDSHAKE_TIMEOUT_MS = 'grpc.server_handshake_timeout_ms'
+      SERVER_MAX_PENDING_REQUESTS = 'grpc.server.max_pending_requests'
 
       # Every argument in the "grpc." namespace that this implementation
       # actually acts on. Anything else in that namespace is a gRPC argument
@@ -124,28 +124,6 @@ module GRPC
         SO_REUSEPORT,
         SSL_TARGET_NAME_OVERRIDE
       ].freeze
-
-      # grpc.default_compression_level picks an algorithm only when nothing
-      # was named explicitly, mirroring
-      # CompressionAlgorithmSet::CompressionAlgorithmForLevel in
-      # src/core/lib/compression/compression_internal.cc:110-150. That
-      # function ranks the non-identity algorithms in a fixed order of
-      # increasing compression -- gzip, then deflate -- filters out any the
-      # bitset disables, and picks LOW/MED/HIGH as
-      # algos[0]/algos[size/2]/algos.back(), with an empty survivor list
-      # giving NONE. Do not "simplify" this back to a single algorithm: with
-      # both enabled that is gzip for low and deflate for medium and high,
-      # and with gzip disabled every level collapses to deflate.
-      #
-      # There is no third algorithm to rank above deflate: "stream/gzip" is
-      # not a real gRPC wire encoding in this codebase.
-      # grpc_compression_algorithm in include/grpc/impl/compression_types.h
-      # is exactly { NONE, DEFLATE, GZIP, ALGORITHMS_COUNT } (lines 62-66);
-      # no STREAM_GZIP variant, nor "stream/gzip" string, exists anywhere
-      # under include/ or src/core in this vendored tree. Implementing one
-      # here would be inventing a feature current gRPC does not have, not
-      # closing a parity gap -- so it stays unimplemented.
-      LEVEL_RANKED_ALGORITHMS = [:gzip, :deflate].freeze
 
       GRPC_NAMESPACE = 'grpc.'
 
@@ -218,10 +196,27 @@ module GRPC
       end
 
       # grpc.default_compression_level picks an algorithm only when nothing
-      # was named explicitly. This core only ever compresses with gzip, so
-      # every level above none maps to gzip when it is enabled, and none
-      # maps to identity, exactly as C-core's level-to-algorithm table does
-      # once a transport with a single non-identity algorithm is in play.
+      # was named explicitly, mirroring
+      # CompressionAlgorithmSet::CompressionAlgorithmForLevel in
+      # src/core/lib/compression/compression_internal.cc:110-150. That
+      # function ranks the non-identity algorithms in a fixed order of
+      # increasing compression -- gzip, then deflate -- filters out any the
+      # bitset disables, and picks LOW/MED/HIGH as
+      # algos[0]/algos[size/2]/algos.back(), with an empty survivor list
+      # giving NONE. Do not "simplify" this back to a single algorithm: with
+      # both enabled that is gzip for low and deflate for medium and high,
+      # and with gzip disabled every level collapses to deflate.
+      #
+      # There is no third algorithm to rank above deflate: "stream/gzip" is
+      # not a real gRPC wire encoding in this codebase.
+      # grpc_compression_algorithm in include/grpc/impl/compression_types.h
+      # is exactly { NONE, DEFLATE, GZIP, ALGORITHMS_COUNT } (lines 62-66);
+      # no STREAM_GZIP variant, nor "stream/gzip" string, exists anywhere
+      # under include/ or src/core in this vendored tree. Implementing one
+      # here would be inventing a feature current gRPC does not have, not
+      # closing a parity gap -- so it stays unimplemented.
+      LEVEL_RANKED_ALGORITHMS = [:gzip, :deflate].freeze
+
       def algorithm_from_level(args)
         level = args[DEFAULT_COMPRESSION_LEVEL]
         return nil unless level.is_a?(Integer) &&

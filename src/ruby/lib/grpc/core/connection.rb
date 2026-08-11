@@ -72,6 +72,10 @@ module GRPC
       attr_accessor :outlier_counter
       # Set by Subchannel#connect_worker right after a successful dial, to
       # whatever XdsClient::LrsCallCounter the resolved address's cluster
+      # asked for (nil when that cluster never requested LRS load
+      # reporting). Call#start_client_call/#op_recv_status bump it; nothing
+      # else touches it.
+      attr_accessor :lrs_counter
 
       # rubocop:disable Metrics/ParameterLists -- all but +io+ are keywords
       def initialize(io, peer:, client:, max_receive_message_length:,

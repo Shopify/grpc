@@ -99,14 +99,14 @@ describe 'xds' do
     )
   end
 
-  def listener_resource(route_config_name: XDS_ROUTE_NAME)
+  def listener_resource(name: XDS_LISTENER_NAME, route_config_name: XDS_ROUTE_NAME)
     hcm = Envoy::Extensions::Filters::Network::HttpConnectionManager::V3::HttpConnectionManager.new(
       rds: Envoy::Extensions::Filters::Network::HttpConnectionManager::V3::Rds.new(
         route_config_name: route_config_name
       )
     )
     Envoy::Config::Listener::V3::Listener.new(
-      name: XDS_LISTENER_NAME,
+      name: name,
       api_listener: Envoy::Config::Listener::V3::ApiListener.new(
         api_listener: any_for(
           'type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager',
@@ -199,6 +199,28 @@ describe 'xds' do
     @rpc_server = nil
   end
 
+  # A second, independent management server for the federation
+  # (authority-qualified target) test: a distinct XdsFakeManagementServer
+  # so requests to it are never conflated with @management's.
+  def start_extra_management_server
+    management = XdsFakeManagementServer.new
+    server = GRPC::RpcServer.new(poll_period: 1)
+    port = server.add_http2_port('0.0.0.0:0', :this_port_is_insecure)
+    server.handle(management)
+    thread = Thread.new { server.run }
+    server.wait_till_running
+    @extra_servers << [server, thread]
+    [management, "0.0.0.0:#{port}"]
+  end
+
+  def stop_extra_management_servers
+    @extra_servers.each do |server, thread|
+      server.stop
+      thread.join(5)
+    end
+    @extra_servers = []
+  end
+
   # A clean app-level end of the response stream leaves the underlying
   # HTTP/2 stream half-open (the client can still write) rather than
   # tearing anything down, so it is not a faithful stand-in for "the
@@ -213,11 +235,13 @@ describe 'xds' do
     spawn_management_server(port)
   end
 
-  def configure_bootstrap(server_uri: @host)
-    ENV['GRPC_XDS_BOOTSTRAP_CONFIG'] = {
+  def configure_bootstrap(server_uri: @host, authorities: nil)
+    config = {
       'xds_servers' => [{ 'server_uri' => server_uri, 'channel_creds' => [{ 'type' => 'insecure' }] }],
       'node' => { 'id' => 'xds-spec-node' }
-    }.to_json
+    }
+    config['authorities'] = authorities unless authorities.nil?
+    ENV['GRPC_XDS_BOOTSTRAP_CONFIG'] = config.to_json
   end
 
   def wait_until(timeout: 5)
@@ -227,11 +251,13 @@ describe 'xds' do
 
   before(:each) do
     GRPC::Core::XdsClient.reset_for_testing!
+    @extra_servers = []
   end
 
   after(:each) do
     GRPC::Core::XdsClient.reset_for_testing!
     stop_management_server
+    stop_extra_management_servers
     ENV.delete('GRPC_XDS_BOOTSTRAP_CONFIG')
     ENV.delete('GRPC_XDS_BOOTSTRAP')
   end
@@ -387,10 +413,42 @@ describe 'xds' do
     end
   end
 
-  describe GRPC::Core::Transport do
-    it 'still rejects an authority-qualified (federated) xds target' do
-      expect { described_class.parse_target('xds://other-authority/svc') }
-        .to raise_error(ArgumentError, /federation/)
+  describe 'xDS federation (gRFC A47)' do
+    it 'resolves an xds://authority/name target through that authority\'s own management server' do
+      start_management_server do
+        federated_authority = 'other-authority.example.com'
+        federated_management, federated_uri = start_extra_management_server
+
+        configure_bootstrap(authorities: {
+                              federated_authority => { 'xds_servers' => [{ 'server_uri' => federated_uri,
+                                                                           'channel_creds' => [{ 'type' => 'insecure' }] }] }
+                            })
+
+        resolved_listener_name = "xdstp://#{federated_authority}/envoy.config.listener.v3.Listener/fed-service"
+        federated_management.on(
+          XDS_LDS, &ack_only_responder(XDS_LDS, listener_resource(name: resolved_listener_name),
+                                       version: 'v1', nonce: 'n-lds-1')
+        )
+        federated_management.on(XDS_RDS, &ack_only_responder(XDS_RDS, route_config_resource, version: 'v1', nonce: 'n-rds-1'))
+        federated_management.on(XDS_CDS, &ack_only_responder(XDS_CDS, cluster_resource, version: 'v1', nonce: 'n-cds-1'))
+        federated_management.on(XDS_EDS, &ack_only_responder(XDS_EDS, endpoint_resource(port: 21_005), version: 'v1', nonce: 'n-eds-1'))
+
+        target = GRPC::Core::Transport.parse_target("xds://#{federated_authority}/fed-service")
+        addresses = GRPC::Core::Transport.resolve_addresses(target)
+
+        expect(addresses.map { |a| [a.host, a.port] }).to eq([['127.0.0.1', 21_005]])
+        wait_until { federated_management.requests.count { |r| !r.response_nonce.empty? } >= 4 }
+        # The top-level (unfederated) management server -- the one @host
+        # points at -- never saw any of this: the whole chain went to the
+        # authority's own server instead.
+        expect(@management.requests).to be_empty
+      end
+    end
+
+    it 'refuses an xds:// target whose authority the bootstrap does not define' do
+      configure_bootstrap(server_uri: 'localhost:1')
+      expect { GRPC::Core::Transport.parse_target('xds://undefined-authority/svc') }
+        .to raise_error(ArgumentError, /authority "undefined-authority".*not defined/)
     end
   end
 end

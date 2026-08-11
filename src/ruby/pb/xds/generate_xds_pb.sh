@@ -14,17 +14,18 @@
 # limitations under the License.
 
 # Regenerates the pure Ruby *message* classes the xDS client (grpc/core/
-# xds_client.rb) decodes: DiscoveryRequest/Response, and the Listener,
-# RouteConfiguration, Cluster and ClusterLoadAssignment resource types plus
-# every proto they transitively import. No service stubs are generated --
-# the ADS stream is a plain bidi call driven through
-# GRPC::ClientStub#bidi_streamer against the method path
-# "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources",
-# so protoc-gen-grpc has nothing to contribute here.
+# xds_client.rb) decodes: DiscoveryRequest/Response, LoadStatsRequest/
+# Response, and the Listener, RouteConfiguration, Cluster,
+# ClusterLoadAssignment and ClusterStats resource types plus every proto
+# they transitively import. No service stubs are generated -- the ADS and
+# LRS streams are both plain bidi calls driven through
+# GRPC::ClientStub#bidi_streamer against their method paths, so
+# protoc-gen-grpc has nothing to contribute here.
 #
-# The file list below is the full transitive closure of the six top-level
-# .proto files, resolved by walking their `import` statements; regenerate
-# it (and this list) if a future top-level proto changes what it imports.
+# The file list below is the full transitive closure of the eight
+# top-level .proto files, resolved by walking their `import` statements;
+# regenerate it (and this list) if a future top-level proto changes what
+# it imports.
 set -e
 cd $(dirname $0)/../../../..
 
@@ -62,6 +63,7 @@ $PROTOC \
     envoy/config/core/v3/udp_socket_config.proto \
     envoy/config/endpoint/v3/endpoint.proto \
     envoy/config/endpoint/v3/endpoint_components.proto \
+    envoy/config/endpoint/v3/load_report.proto \
     envoy/config/listener/v3/api_listener.proto \
     envoy/config/listener/v3/listener.proto \
     envoy/config/listener/v3/listener_components.proto \
@@ -75,6 +77,7 @@ $PROTOC \
     envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto \
     envoy/service/discovery/v3/ads.proto \
     envoy/service/discovery/v3/discovery.proto \
+    envoy/service/load_stats/v3/lrs.proto \
     envoy/type/http/v3/path_transformation.proto \
     envoy/type/matcher/v3/address.proto \
     envoy/type/matcher/v3/filter_state.proto \

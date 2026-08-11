@@ -44,12 +44,17 @@ module GRPC
       # for an :xds target, or [self] for a :unix target. An :xds target
       # has no real network host/port of its own -- #path carries the
       # resource name instead, and #host mirrors it so TLS hostname
-      # verification has something to check when no override is given.
-      # +weight+ is nil except for an EDS-resolved :xds endpoint, where it
-      # carries the LbEndpoint's load_balancing_weight for the
-      # ring_hash/weighted_round_robin LB policies; every other resolver
-      # leaves it nil and those policies treat that as weight 1.
-      Target = Struct.new(:scheme, :host, :port, :path, :addresses, :weight) do
+      # verification has something to check when no override is given;
+      # #xds_authority carries the control-plane authority a federated
+      # ("xds://authority/name") target named, nil for the common
+      # unfederated case. +weight+ is nil except for an EDS-resolved :xds
+      # endpoint, where it carries the LbEndpoint's load_balancing_weight
+      # for the ring_hash/weighted_round_robin LB policies; every other
+      # resolver leaves it nil and those policies treat that as weight 1.
+      # +lrs_counter+ is likewise nil except for an EDS-resolved :xds
+      # endpoint whose owning cluster asked for LRS load reporting; see
+      # XdsClient::LrsCallCounter.
+      Target = Struct.new(:scheme, :host, :port, :path, :addresses, :weight, :xds_authority, :lrs_counter) do
         def to_peer
           return "unix:#{path}" if scheme == :unix
           family = host.include?(':') ? 'ipv6' : 'ipv4'
@@ -78,25 +83,33 @@ module GRPC
         Target.new(:tcp, host, port, nil)
       end
 
-      # "xds:///my-service" names a resource, not a host to look up; the
-      # authority-qualified form ("xds://authority/my-service") picks a
-      # non-default management server, which is federation and out of
-      # scope here, so it is rejected rather than silently mishandled.
-      # Loads (and validates) the bootstrap immediately so a bad
-      # GRPC_XDS_BOOTSTRAP fails channel construction, not the first RPC.
+      # "xds:///my-service" (or the authority-less "xds:my-service") names
+      # a resource on the bootstrap's own management server. The
+      # authority-qualified form ("xds://authority/my-service") is gRFC
+      # A47 federation: +authority+ must be a key of the bootstrap's
+      # "authorities" map, checked here (not left to XdsClient) so an
+      # unknown authority fails channel construction, not the first RPC,
+      # exactly like the missing/malformed-bootstrap checks below.
       def xds_target(str)
         rest = str.delete_prefix('xds:')
         rest = rest.delete_prefix('//') if rest.start_with?('//')
-        if rest.include?('/') && !rest.start_with?('/')
-          fail ArgumentError,
-               "unsupported xds target #{str.inspect}: authority-qualified xds " \
-               'targets (federation) are not supported'
-        end
-        name = rest.delete_prefix('/')
-        fail ArgumentError, "bad xds target #{str.inspect}: missing resource name" if name.empty?
+        authority, name =
+          if rest.start_with?('/')
+            [nil, rest.delete_prefix('/')]
+          elsif rest.include?('/')
+            rest.split('/', 2)
+          else
+            [nil, rest]
+          end
+        fail ArgumentError, "bad xds target #{str.inspect}: missing resource name" if name.nil? || name.empty?
         load_xds!
-        XdsClient.bootstrap!
-        Target.new(:xds, name, nil, name)
+        config = XdsClient.bootstrap!
+        if authority && !config.authorities.key?(authority)
+          fail ArgumentError,
+               "unsupported xds target #{str.inspect}: authority #{authority.inspect} is not defined by " \
+               'the xDS bootstrap\'s "authorities" map'
+        end
+        Target.new(:xds, name, nil, name, nil, nil, authority)
       end
 
       # xds_client.rb loads the generated Envoy protobuf classes, which is
@@ -124,9 +137,17 @@ module GRPC
         target.addresses =
           case target.scheme
           when :unix then [target]
-          when :xds then (load_xds! and XdsClient.instance.resolve_endpoints(target.path))
+          when :xds then (load_xds! and xds_addresses(target))
           else dns_addresses(target, args)
           end
+      end
+
+      # Federation (gRFC A47): #path is the plain resource name and
+      # #xds_authority (nil for the common unfederated case) is the
+      # bootstrap "authorities" entry that names it, already validated to
+      # exist by #xds_target.
+      def xds_addresses(target)
+        XdsClient.instance.resolve_endpoints(target.path, authority: target.xds_authority)
       end
 
       def dns_addresses(target, args)
@@ -400,9 +421,6 @@ module GRPC
         context
       end
 
-      # Binds a listening socket for +addr+ ("host:port"); port 0 picks one.
-      #
-      # @return [Array(TCPServer, Integer)] the listener and the bound port
       # Wildcard hosts grpc.expand_wildcard_addrs treats as needing
       # expansion into every concrete local address of that family, rather
       # than left as the one socket the kernel would otherwise route every
@@ -442,18 +460,6 @@ module GRPC
       # An address present in the interface list but not actually bindable
       # (e.g. a VPN address with no local listening stack) is skipped rather
       # than failing the whole call, the way grpc_tcp_server_add_port does.
-      # Every concrete address bound to a local interface of +family+, once
-      # each. A link-local IPv6 address carries a "%scope" suffix that
-      # TCPServer.new does not accept back as a host.
-      def local_addresses(family)
-        Socket.getifaddrs.each_with_object([]) do |ifaddr, hosts|
-          addr = ifaddr.addr
-          next if addr.nil? || addr.afamily != family
-          ip = addr.ip_address.split('%').first
-          hosts << ip unless hosts.include?(ip)
-        end
-      end
-
       def listen_expanded(target, so_reuseport)
         family = target.host.include?(':') ? Socket::AF_INET6 : Socket::AF_INET
         hosts = local_addresses(family)
@@ -474,6 +480,18 @@ module GRPC
           fail SocketError, "could not bind any local address to expand #{target.host}"
         end
         listeners
+      end
+
+      # Every concrete address bound to a local interface of +family+, once
+      # each. A link-local IPv6 address carries a "%scope" suffix that
+      # TCPServer.new does not accept back as a host.
+      def local_addresses(family)
+        Socket.getifaddrs.each_with_object([]) do |ifaddr, hosts|
+          addr = ifaddr.addr
+          next if addr.nil? || addr.afamily != family
+          ip = addr.ip_address.split('%').first
+          hosts << ip unless hosts.include?(ip)
+        end
       end
 
       def peer_of(socket)

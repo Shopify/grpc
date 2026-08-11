@@ -35,7 +35,14 @@ module GRPC
       # not implemented.
       XdsServer = Struct.new(:server_uri, :channel_creds_type)
 
-      Config = Struct.new(:servers, :node, :listener_resource_name_template)
+      # One entry from the top-level "authorities" map (gRFC A47): the
+      # servers a federated "xds://<name>/resource" target is resolved
+      # against (nil when the entry has no "xds_servers" of its own, so the
+      # top-level servers apply instead), and the template an
+      # authority-qualified resource name is built from.
+      Authority = Struct.new(:servers, :listener_resource_name_template)
+
+      Config = Struct.new(:servers, :node, :listener_resource_name_template, :authorities)
 
       module_function
 
@@ -63,7 +70,8 @@ module GRPC
       def parse(json)
         data = JSON.parse(json)
         fail Error, 'the xDS bootstrap config must be a JSON object' unless data.is_a?(Hash)
-        Config.new(parse_servers(data), data['node'] || {}, data['client_default_listener_resource_name_template'])
+        Config.new(parse_servers(data), data['node'] || {},
+                   data['client_default_listener_resource_name_template'], parse_authorities(data))
       rescue JSON::ParserError => e
         fail Error, "the xDS bootstrap config is not valid JSON: #{e.message}"
       end
@@ -85,6 +93,26 @@ module GRPC
         type = creds.first.is_a?(Hash) ? creds.first['type'] : nil
         fail Error, "xds_servers entry #{uri.inspect} has a channel_creds entry with no \"type\"" if type.nil?
         XdsServer.new(uri, type)
+      end
+
+      def parse_authorities(data)
+        raw = data['authorities']
+        return {} if raw.nil?
+        fail Error, 'the xDS bootstrap config\'s "authorities" must be a JSON object' unless raw.is_a?(Hash)
+        raw.to_h { |name, entry| [name, parse_authority(name, entry)] }
+      end
+
+      def parse_authority(name, entry)
+        fail Error, "authorities entry #{name.inspect} must be a JSON object" unless entry.is_a?(Hash)
+        servers = entry.key?('xds_servers') ? parse_servers(entry) : nil
+        template = entry['client_listener_resource_name_template'] ||
+                   "xdstp://#{name}/envoy.config.listener.v3.Listener/%s"
+        unless template.start_with?("xdstp://#{name}/")
+          fail Error,
+               "authorities entry #{name.inspect} has a \"client_listener_resource_name_template\" " \
+               "that does not start with \"xdstp://#{name}/\""
+        end
+        Authority.new(servers, template)
       end
     end
   end

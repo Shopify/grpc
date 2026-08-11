@@ -41,6 +41,12 @@ module GRPC
       # OutlierDetectionPolicy#evaluate.
       attr_accessor :outlier_counter
 
+      # Set once, by Channel#new_subchannel, from the resolved address's
+      # own Target#lrs_counter -- nil unless this address came from an xds
+      # cluster that requested LRS load reporting. Forwarded the same way
+      # as #outlier_counter above.
+      attr_accessor :lrs_counter
+
       # +dial+ is called as dial.(address, on_close) => Connection, in a
       # background thread. +on_state_change+ is called with +self+, outside
       # this subchannel's lock, after every state transition, so the owner
@@ -175,6 +181,7 @@ module GRPC
           else
             @connection = connection
             connection.outlier_counter = @outlier_counter if @outlier_counter
+            connection.lrs_counter = @lrs_counter if @lrs_counter
             @last_error = nil
             @healthy = true
             @health_watcher = start_health_watcher_locked(connection)
