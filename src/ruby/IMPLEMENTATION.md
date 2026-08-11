@@ -104,15 +104,25 @@ place of about 6800 lines of C.
   hand it over positionally. `GRPC.logger` accepts any object a user
   supplies, and plenty of them define `debug(msg)` with a required
   argument, so calling the logger with a block and no argument raises.
+- **An idle subchannel is redialled only while a sibling is alive.**
+  Nothing else redials one: `#await_connection` reconnects on a failed
+  pick, and a pick keeps succeeding while any other address answers, so
+  a backend that closed its own connection would otherwise be dropped
+  for the life of the process. The guard is a live sibling and not an
+  aggregate state, because a single-address channel going READY to IDLE
+  aggregates to IDLE, and redialling there races the backoff path that
+  owns "every address failed".
 
 ## Verification
 
 | Suite | How to run | State |
 | --- | --- | --- |
-| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 504 examples, 6 failures |
+| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 848 examples, 6 failures |
 | End to end | run each `src/ruby/end2end/*_test.rb` | 23 of 24 |
-| gRPC interop | `src/ruby/pb/test/{server,client}.rb` | 14 of 14, insecure and TLS |
+| gRPC interop | `src/ruby/pb/test/{server,client}.rb` | 16 of 16, insecure and TLS |
+| xDS conformance | `ruby src/ruby/pb/test/xds_conformance/run.rb` | 5 of 5 |
 | h2spec | point it at a server on the vendored session | 146 of 146, both write paths, 10 runs each |
+| Negative HTTP/2 | `test/http2_test/http2_test_server.py`, see below | 8 of 8 |
 | hpack-test-case | kantan's `test/test_hpack.rb` | 41 runs, 0 failures |
 | RuboCop | `rake rubocop` | clean |
 
@@ -121,11 +131,33 @@ The six RSpec failures and the one end to end failure all shell out to
 Those are C++ build artifacts. The tests compare generated `.rb` files
 and never load the Ruby runtime. Build the plugin to run them.
 
-The interop cases are the list in `tools/run_tests/run_interop_tests.py`,
-less the ones that `RubyLanguage#unimplemented_test_cases_server` skips.
-The authentication cases need real credentials, so they are not covered
-here. Cross-language interop needs the Docker images that
+The interop cases are every credential-free case in
+`tools/run_tests/run_interop_tests.py`. Upstream runs 14 of them for Ruby
+and lists both compression cases as server-unimplemented; the two are
+implemented and run here, which is the only external test the deflate and
+gzip paths have. The authentication cases need real credentials, so they
+are not covered. Cross-language interop needs the Docker images that
 `run_interop_tests.py` builds.
+
+RSpec is the largest suite and the weakest signal: it was written beside
+this code and can only catch a regression against this implementation's
+own model, never a disagreement with gRPC. The suites that can are the
+ones that run somebody else's client or server against this one, and two
+of them had to be built or repaired to run at all.
+
+`src/ruby/pb/test/xds_conformance/run.rb` drives the real
+`pb/test/xds_client.rb` against an in-process fake control plane and real
+backends. Upstream's driver, `tools/run_tests/run_xds_tests.py`, needs GCP
+and Traffic Director, so no CI script anywhere references the Ruby xDS
+client; before this harness it had never been run. It found the endpoint
+push gap and, through it, the idle-subchannel redial bug.
+
+`test/http2_test/http2_test_server.py` points adversarial servers at this
+client, where h2spec points a client at this server. It is Python 2 era
+and dead on modern Python; run a patched copy outside the tree rather
+than modifying it, pinning `h2==3.2.0` and `protobuf==3.20.3`, and fixing
+`dict.has_key`, the `client_side` keyword that moved into
+`H2Configuration`, and a str buffer that must be bytes.
 
 ## Performance
 
@@ -531,12 +563,18 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   is deliberately not retried: requests and responses interleave on
   independent threads, so there is no point at which everything sent so
   far is both known and safe to replay. Hedging is unary only.
-- The xDS client follows LDS, RDS, CDS and EDS over ADS and hands the
-  endpoints to the existing LB policies. It does not implement LRS load
-  reporting, SDS certificate provisioning, RBAC or fault-injection
-  filters, aggregate clusters, federation (an authority-qualified
-  `xds://authority/name` target is refused), or weighted locality routing
-  beyond taking the heaviest cluster of a weighted set.
+- The xDS client follows LDS, RDS, CDS and EDS over ADS, reports load
+  back over LRS, resolves authority-qualified `xds://authority/name`
+  targets against the bootstrap, and pushes endpoint changes into a live
+  channel. It does not implement SDS certificate provisioning, RBAC or
+  fault-injection filters, aggregate clusters, or weighted locality
+  routing beyond taking the heaviest cluster of a weighted set.
+- A pushed endpoint list reaches a running channel; a DNS one does not.
+  `dns:` targets still resolve once and re-resolve only after every
+  address has failed, with no polling timer, which is what the C
+  extension did. The machinery to change that is now in place:
+  `Transport.watch_addresses` and `Channel#apply_resolver_push` take an
+  address list from any source.
 - The generated Envoy protobufs under `pb/xds` load on demand, the first
   time a target names the `xds` scheme. Do not require `xds_client.rb`
   from anything that loads eagerly; see the performance note above for
@@ -557,9 +595,21 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   freed the channel from a GC callback, and every xDS stream reconnect
   left its write pump polling a queue nobody would ever push to. Anything
   that starts a thread needs an owner that joins it.
-- `GRPC::Core::CompressionOptions` is honoured for channel arguments.
-  A server does not compress a response unless the client asked for an
-  algorithm.
+- `GRPC::Core::CompressionOptions` is honoured for channel arguments. A
+  server does not compress a response unless the client asked for an
+  algorithm, and a call may name the encoding of its own response, which
+  is what the interop `response_compressed` flag asks for. There is no
+  `stream/gzip`: it is absent from this repository's own algorithm enum,
+  and upstream deleted the code behind it in 2021, so implementing it
+  would be inventing a feature rather than matching one.
 - `load_grpc_with_gc_stress_test.rb` passes but takes about five minutes.
   It sets `GC.stress` before it loads the library, and loading Ruby code
   allocates far more than opening a shared object did.
+- A test written beside the code cannot find a disagreement with gRPC,
+  only a regression against this model of it. Both production bugs found
+  in the last round came from suites that run something external: the
+  endpoint push gap and the idle redial bug from driving the real xDS
+  client against a control plane, the compression gap from an interop
+  case upstream had marked unimplemented. Prefer repairing a suite that
+  talks to somebody else's code over adding another example to
+  `src/ruby/spec`.
