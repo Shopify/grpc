@@ -484,6 +484,22 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   per cent between runs, enough to hide a real 4 per cent change and to
   invent one that is not there. Two changes tried here were reverted
   because paired runs showed no effect.
+- Run a null patch first and read every result against it. Identical code
+  on both sides measures **+7.3 per cent on `unary_empty`**, 9 pairs of 16:
+  the A position is systematically favoured on that metric. A feature batch
+  that read +12.7 per cent there was really worth about 5. On `unary_large`
+  and `unary_concurrent` the floor is under 1 per cent at 7 or 8 pairs of
+  16, so a result at 8/16 is nothing whatever the mean says. Trust the pair
+  count over the mean: outliers move a mean and cannot move a count.
+- Two regressions were found this way, neither visible in any spec. A
+  `Mutex` taken on every RPC to read an already-memoised service config
+  cost **12 per cent on the eight-thread benchmark**, fixed by reading the
+  memo before taking the lock. Requiring the generated xDS protobufs from
+  `transport.rb` cost **about 7 per cent on 64 KiB unary**, because 51000
+  objects of Envoy message classes sat in the heap of every channel that
+  never names an `xds:` target; loading them on demand put that metric back
+  on the null floor. Neither shows up in a profile of the RPC path: one is
+  lock contention, the other is GC pressure.
 
 ## Known gaps
 
@@ -494,20 +510,27 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
 - Configuration this implementation cannot act on is refused rather than
   ignored. A channel argument in the `grpc.` namespace that is not in
   `ChannelArgs::HONOURED` raises `ArgumentError`, and so does a target
-  scheme outside `dns`, `ipv4`, `ipv6` and `unix`. Names outside the
-  `grpc.` namespace are still ignored, which is what the C extension did
-  with them, and `channel_spec.rb` pins that. The alternative was a
-  keepalive setting that reads as configured and sends no PING.
-- There is no keepalive, so `grpc.keepalive_time_ms` is rejected by the
-  rule above. A half-open connection is noticed when a read fails.
-- There is no retry policy, no service config, no load balancing beyond
-  one connection per channel, and no name resolution beyond DNS through
-  the resolver of the host. Their channel arguments are rejected.
-- XDS credentials fall back to their wrapped credentials. There is no
-  xDS control plane client, and `xds:///` is rejected as a target rather
-  than parsed as the host `xds`.
-- Health checking implements `Check`. There is no `Watch`, no server
-  reflection and no channelz.
+  scheme outside `dns`, `ipv4`, `ipv6`, `unix` and `xds`. Names outside
+  the `grpc.` namespace are still ignored, which is what the C extension
+  did with them, and `channel_spec.rb` pins that.
+- Retries cover unary, server-streaming and client-streaming calls. Bidi
+  is deliberately not retried: requests and responses interleave on
+  independent threads, so there is no point at which everything sent so
+  far is both known and safe to replay. Hedging is unary only.
+- The xDS client follows LDS, RDS, CDS and EDS over ADS and hands the
+  endpoints to the existing LB policies. It does not implement LRS load
+  reporting, SDS certificate provisioning, RBAC or fault-injection
+  filters, aggregate clusters, federation (an authority-qualified
+  `xds://authority/name` target is refused), or weighted locality routing
+  beyond taking the heaviest cluster of a weighted set.
+- The generated Envoy protobufs under `pb/xds` load on demand, the first
+  time a target names the `xds` scheme. Do not require `xds_client.rb`
+  from anything that loads eagerly; see the performance note above for
+  what that cost.
+- Health checking implements `Check`. There is no `Watch`, which upstream
+  Ruby does not implement either, and no server reflection or channelz;
+  the C extension exposed none of the three to Ruby, so they were never
+  parity gaps.
 - `GRPC::Core::CompressionOptions` is honoured for channel arguments.
   A server does not compress a response unless the client asked for an
   algorithm.
