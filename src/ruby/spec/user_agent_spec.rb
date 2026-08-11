@@ -46,10 +46,24 @@ describe 'user agent' do
     @srv_thd.join
   end
 
-  it 'client sends expected user agent' do
+  # Every stub opens its own channel, and a channel not closed keeps its
+  # connection-maintenance thread running for the rest of the process. Track
+  # every stub created here and close it, instead of leaking one thread per
+  # stub into every spec file that runs after this one.
+  after(:each) do
+    (@stubs || []).each(&:close)
+  end
+
+  def new_stub(channel_args: {})
     stub = UserAgentEchoServiceStub.new("localhost:#{@port}",
                                         :this_channel_is_insecure,
-                                        channel_args: {})
+                                        channel_args: channel_args)
+    (@stubs ||= []) << stub
+    stub
+  end
+
+  it 'client sends expected user agent' do
+    stub = new_stub
     response = stub.an_rpc(EchoMsg.new)
     expected_user_agent_prefix = "grpc-ruby/#{GRPC::VERSION}"
     expect(response.msg.start_with?(expected_user_agent_prefix)).to be true
@@ -60,9 +74,7 @@ describe 'user agent' do
   it 'user agent header does not grow when the same channel args hash is used across multiple stubs' do
     shared_channel_args_hash = {}
     10.times do
-      stub = UserAgentEchoServiceStub.new("localhost:#{@port}",
-                                          :this_channel_is_insecure,
-                                          channel_args: shared_channel_args_hash)
+      stub = new_stub(channel_args: shared_channel_args_hash)
       response = stub.an_rpc(EchoMsg.new)
       puts "got echo response: #{response.msg}"
       expected_user_agent_prefix = "grpc-ruby/#{GRPC::VERSION}"
@@ -70,5 +82,15 @@ describe 'user agent' do
       # check that the expected user agent prefix occurs in the real user agent exactly once
       expect(response.msg.split(expected_user_agent_prefix).size).to eq 2
     end
+  end
+
+  it 'closing a stub stops its channel background threads' do
+    before = Thread.list.size
+    stub = new_stub
+    stub.an_rpc(EchoMsg.new)
+    stub.close
+    @stubs.delete(stub)
+    sleep 0.05
+    expect(Thread.list.size).to be <= before
   end
 end

@@ -111,6 +111,7 @@ module GRPC
         @channel_creds = creds
       end
 
+      @owns_channel = channel_override.nil?
       @ch = ClientStub.setup_channel(channel_override, host, @channel_creds,
                                      channel_args.dup)
       alt_host = channel_args[Core::Channel::SSL_TARGET]
@@ -118,6 +119,18 @@ module GRPC
       @propagate_mask = propagate_mask
       @timeout = timeout.nil? ? DEFAULT_TIMEOUT : timeout
       @interceptors = InterceptorRegistry.new(interceptors)
+    end
+
+    # Closes the channel this stub opened for itself. A stub built with
+    # :channel_override does not own that channel and leaves it alone; the
+    # caller who supplied it is responsible for closing it.
+    #
+    # Without this, the channel's background threads (resolution, connection
+    # maintenance) run for as long as the process does, since nothing else
+    # references the channel once the stub is dropped.
+    def close
+      @ch.close if @owns_channel
+      nil
     end
 
     # request_response sends a request to a GRPC server, and returns the

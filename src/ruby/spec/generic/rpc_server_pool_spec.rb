@@ -62,6 +62,7 @@ describe GRPC::Pool do
         wait = false
         wait_cv.broadcast
       end
+      p.stop
     end
   end
 
