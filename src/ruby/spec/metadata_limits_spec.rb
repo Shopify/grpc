@@ -77,12 +77,27 @@ describe 'metadata limits and compression level' do
       expect { described_class.normalize(args) }.to_not raise_error
     end
 
+    # CompressionAlgorithmSet::CompressionAlgorithmForLevel,
+    # src/core/lib/compression/compression_internal.cc:110-150, ranks the
+    # enabled non-identity algorithms {gzip, deflate} in that fixed order of
+    # increasing compression, then LOW takes the first, HIGH the last, and
+    # MED the middle -- so with both enabled, medium and high both land on
+    # deflate, past gzip.
     describe '.compression_algorithm' do
-      it 'picks gzip for a non-none level' do
+      it 'picks gzip for the low level' do
         expect(described_class.compression_algorithm(
                  'grpc.default_compression_level' =>
-                   GRPC::Core::CompressionOptions::LEVEL_VALUES[:high]
+                   GRPC::Core::CompressionOptions::LEVEL_VALUES[:low]
                )).to eq('gzip')
+      end
+
+      it 'picks deflate for medium and high levels' do
+        [:medium, :high].each do |level|
+          expect(described_class.compression_algorithm(
+                   'grpc.default_compression_level' =>
+                     GRPC::Core::CompressionOptions::LEVEL_VALUES[level]
+                 )).to eq('deflate')
+        end
       end
 
       it 'picks identity (no algorithm) for level none' do
@@ -112,12 +127,27 @@ describe 'metadata limits and compression level' do
         expect(described_class.compression_algorithm(args)).to be_nil
       end
 
-      it 'does not offer a level-selected algorithm the bitset disables' do
+      # Disabling gzip alone does not silently drop back to no compression:
+      # deflate is still enabled, and compression_internal.cc's ranked table
+      # (see the describe-block comment above) falls through to it, exactly
+      # as it would if gzip weren't compiled in at all.
+      it 'falls back to deflate when the bitset disables gzip alone' do
         gzip = GRPC::Core::CompressionOptions::ALGORITHM_VALUES[:gzip]
         args = {
           'grpc.default_compression_level' =>
             GRPC::Core::CompressionOptions::LEVEL_VALUES[:high],
           'grpc.compression_enabled_algorithms_bitset' => ~(1 << gzip)
+        }
+        expect(described_class.compression_algorithm(args)).to eq('deflate')
+      end
+
+      it 'offers no algorithm once the bitset disables both gzip and deflate' do
+        gzip = GRPC::Core::CompressionOptions::ALGORITHM_VALUES[:gzip]
+        deflate = GRPC::Core::CompressionOptions::ALGORITHM_VALUES[:deflate]
+        args = {
+          'grpc.default_compression_level' =>
+            GRPC::Core::CompressionOptions::LEVEL_VALUES[:high],
+          'grpc.compression_enabled_algorithms_bitset' => ~((1 << gzip) | (1 << deflate))
         }
         expect(described_class.compression_algorithm(args)).to be_nil
       end

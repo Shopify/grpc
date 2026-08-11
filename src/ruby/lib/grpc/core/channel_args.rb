@@ -125,6 +125,28 @@ module GRPC
         SSL_TARGET_NAME_OVERRIDE
       ].freeze
 
+      # grpc.default_compression_level picks an algorithm only when nothing
+      # was named explicitly, mirroring
+      # CompressionAlgorithmSet::CompressionAlgorithmForLevel in
+      # src/core/lib/compression/compression_internal.cc:110-150. That
+      # function ranks the non-identity algorithms in a fixed order of
+      # increasing compression -- gzip, then deflate -- filters out any the
+      # bitset disables, and picks LOW/MED/HIGH as
+      # algos[0]/algos[size/2]/algos.back(), with an empty survivor list
+      # giving NONE. Do not "simplify" this back to a single algorithm: with
+      # both enabled that is gzip for low and deflate for medium and high,
+      # and with gzip disabled every level collapses to deflate.
+      #
+      # There is no third algorithm to rank above deflate: "stream/gzip" is
+      # not a real gRPC wire encoding in this codebase.
+      # grpc_compression_algorithm in include/grpc/impl/compression_types.h
+      # is exactly { NONE, DEFLATE, GZIP, ALGORITHMS_COUNT } (lines 62-66);
+      # no STREAM_GZIP variant, nor "stream/gzip" string, exists anywhere
+      # under include/ or src/core in this vendored tree. Implementing one
+      # here would be inventing a feature current gRPC does not have, not
+      # closing a parity gap -- so it stays unimplemented.
+      LEVEL_RANKED_ALGORITHMS = [:gzip, :deflate].freeze
+
       GRPC_NAMESPACE = 'grpc.'
 
       # gRPC's own default for both directions is 4 MiB receive, unlimited
@@ -204,9 +226,19 @@ module GRPC
         level = args[DEFAULT_COMPRESSION_LEVEL]
         return nil unless level.is_a?(Integer) &&
                           level != CompressionOptions::LEVEL_VALUES[:none]
-        gzip = CompressionOptions::ALGORITHM_VALUES[:gzip]
-        return nil unless algorithm_enabled?(args, gzip)
-        'gzip'
+        ranked = LEVEL_RANKED_ALGORITHMS.select do |name|
+          algorithm_enabled?(args, CompressionOptions::ALGORITHM_VALUES[name])
+        end
+        return nil if ranked.empty?
+        picked = case level
+                 when CompressionOptions::LEVEL_VALUES[:low]
+                   ranked.first
+                 when CompressionOptions::LEVEL_VALUES[:high]
+                   ranked.last
+                 else
+                   ranked[ranked.size / 2]
+                 end
+        picked.to_s
       end
 
       def algorithm_enabled?(args, value)

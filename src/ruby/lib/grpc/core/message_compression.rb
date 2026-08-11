@@ -25,6 +25,22 @@ module GRPC
     module MessageCompression
       # The wire names of the compression algorithms supported by gRPC
       # message framing, as they appear in the grpc-encoding header.
+      #
+      # gRPC's other historical per-message-framing scheme, "stream/gzip"
+      # (GRPC_COMPRESS_STREAM_GZIP: gzip applied across the whole HTTP/2
+      # stream rather than independently per message), is deliberately not
+      # here. grpc_compression_algorithm in
+      # include/grpc/impl/compression_types.h:62-66 is exactly { NONE,
+      # DEFLATE, GZIP, ALGORITHMS_COUNT } -- no STREAM_GZIP variant, nor a
+      # "stream/gzip" string, exists anywhere under include/ or src/core in
+      # this vendored tree. Upstream deleted it in grpc/grpc#28223 (2021),
+      # commit message "eliminate stream based compression (this is
+      # seemingly unused in practice)", which also removed
+      # src/core/lib/compression/stream_compression.cc and its fuzzers and
+      # end2end tests. No maintained gRPC C-core, grpc-go, or grpc-js peer
+      # advertises or accepts it any more, so implementing it here would be
+      # inventing a feature current gRPC does not have -- not closing a
+      # parity gap -- and would only let this Ruby core talk to itself.
       SUPPORTED = %w[identity deflate gzip].freeze
 
       # Returns true when the given wire name is a supported algorithm.
