@@ -49,6 +49,11 @@ module GRPC
       # gRPC waits 20 seconds for a keepalive PING to be acknowledged.
       DEFAULT_KEEPALIVE_TIMEOUT = 20.0
 
+      # grpc.http2.max_pings_without_data and grpc.http2.max_ping_strikes:
+      # C-core defaults both to 2.
+      DEFAULT_MAX_PINGS_WITHOUT_DATA = 2
+      DEFAULT_MAX_PING_STRIKES = 2
+
       # How often the maintenance timer wakes to re-check every deadline
       # (keepalive, idle, age). Finer than any one interval so several
       # features sharing the thread do not lose precision to each other.
@@ -64,6 +69,9 @@ module GRPC
                      keepalive_permit_without_calls: false,
                      max_connection_idle: nil, max_connection_age: nil,
                      max_connection_age_grace: nil, client_idle_timeout: nil,
+                     max_pings_without_data: DEFAULT_MAX_PINGS_WITHOUT_DATA,
+                     min_time_between_pings: nil,
+                     max_ping_strikes: DEFAULT_MAX_PING_STRIKES,
                      on_new_rpc: nil, on_close: nil)
         super()
         @io = io
@@ -79,6 +87,14 @@ module GRPC
         @max_connection_age = max_connection_age
         @max_connection_age_grace = max_connection_age_grace
         @client_idle_timeout = client_idle_timeout
+        # grpc.http2.max_pings_without_data (0 = unlimited) and
+        # grpc.http2.min_time_between_pings_ms bound how often *this* side
+        # sends a keepalive PING, on top of grpc.keepalive_time_ms itself.
+        @max_pings_without_data = max_pings_without_data
+        @min_time_between_pings = min_time_between_pings
+        @pings_without_data = 0
+        @last_ping_sent_at = nil
+        @data_frames_sent_at_last_ping = 0
         @maintenance_thread = nil
         # Set while a PING we sent has not been acknowledged. The reader
         # thread clears it through #on_ping.
@@ -89,6 +105,10 @@ module GRPC
         @goaway_sent = false
         @age_grace_deadline = nil
         @created_at = nil
+        # Set once a GOAWAY has been *received* from the peer: no new stream
+        # is offered from then on, and the connection closes itself once
+        # every stream at or below the peer's last_stream_id has finished.
+        @draining = false
         # The moment @streams last became empty, i.e. the start of the
         # current idle period; nil while an RPC is in flight.
         @idle_since = nil
@@ -101,7 +121,8 @@ module GRPC
         @handshaked = false
         @handshake_cv = ConditionVariable.new
         @session = Http2::Kantan::H2::Session.new(
-          io, handler: self, max_concurrent_streams: max_concurrent_streams)
+          io, handler: self, max_concurrent_streams: max_concurrent_streams,
+              max_ping_strikes: max_ping_strikes)
       end
       # rubocop:enable Metrics/ParameterLists
 
@@ -161,6 +182,29 @@ module GRPC
         @mu.synchronize { @ping_deadline = nil }
       end
 
+      # The peer will not process anything above +last_stream_id+, so this
+      # connection stops offering new streams and starts winding down:
+      # streams already accepted keep running to completion, anything past
+      # that boundary was never seen by the peer and is safe to retry
+      # elsewhere, and the connection closes itself once nothing is left on
+      # it -- the resulting #on_close is what lets a Subchannel notice and
+      # dial a fresh connection on the next call. Called by the session's
+      # reader thread; does *not* tear the session down itself (see
+      # Session#handle_goaway), so in-flight RPCs keep reading and writing.
+      def on_goaway(last_stream_id, _error_code)
+        refused = @mu.synchronize do
+          return if @closed
+          @draining = true
+          @streams.each_key.select { |id| id > last_stream_id }
+                           .each_with_object({}) { |id, acc| acc[id] = @streams.delete(id) }
+        end
+        refused.each_value do |stream|
+          stream.push_failure(StatusCodes::UNAVAILABLE,
+                              'stream never reached the peer before its GOAWAY')
+        end
+        close_if_drained
+      end
+
       def alive?
         @mu.synchronize { !@closed }
       end
@@ -174,6 +218,7 @@ module GRPC
       def open_rpc
         @mu.synchronize do
           fail Closed, 'connection is closed' if @closed
+          fail Closed, 'connection is draining after a GOAWAY from the peer' if @draining
           id = @session.new_stream
           @streams[id] = new_stream(id)
         end
@@ -182,10 +227,12 @@ module GRPC
       # Marks when the last RPC finished, so the maintenance loop can measure
       # how long the connection has sat with nothing running on it.
       def forget(stream_id)
-        @mu.synchronize do
+        drained = @mu.synchronize do
           @streams.delete(stream_id)
           @idle_since = RpcStream.now if @streams.empty?
+          @draining && @streams.empty?
         end
+        close(StatusCodes::UNAVAILABLE, 'connection drained after a GOAWAY from the peer') if drained
       end
 
       # Sends GOAWAY and tears the socket down, failing every live RPC.
@@ -309,6 +356,15 @@ module GRPC
 
       private
 
+      # Called after a GOAWAY has finished refusing streams above
+      # last_stream_id: if nothing was left running below it, the
+      # connection is already fully drained and there is nothing left to
+      # wait for.
+      def close_if_drained
+        drained = @mu.synchronize { @draining && @streams.empty? }
+        close(StatusCodes::UNAVAILABLE, 'connection drained after a GOAWAY from the peer') if drained
+      end
+
       # Runs every MAINTENANCE_POLL_INTERVAL and drives whichever of
       # keepalive, the server-side idle/age limits, and the client-side idle
       # timeout this connection was configured with. Polling on a short,
@@ -346,17 +402,44 @@ module GRPC
           close(StatusCodes::UNAVAILABLE, 'keepalive ping timed out')
           return [next_ping_at, true]
         end
+        note_data_sent_since_last_ping
         return [next_ping_at, false] if now < next_ping_at
-        if ping_permitted?
-          @mu.synchronize { @ping_deadline = now + @keepalive_timeout if @ping_deadline.nil? }
-          begin
-            @session.ping
-          rescue StandardError
-            # The write side is already gone; the reader will finish the job.
-            return [next_ping_at, false]
-          end
-        end
+        send_keepalive_ping(now) if ping_permitted? && ping_policing_permits?(now)
         [now + @keepalive_time, false]
+      end
+
+      # grpc.http2.max_pings_without_data: a data or header frame sent on
+      # this connection since the last time this ran means the peer is not
+      # starved for activity, so any pings already counted against the
+      # limit no longer apply.
+      def note_data_sent_since_last_ping
+        sent = @session.data_frames_sent
+        return if sent == @data_frames_sent_at_last_ping
+        @data_frames_sent_at_last_ping = sent
+        @pings_without_data = 0
+      end
+
+      # grpc.http2.max_pings_without_data (0 = unlimited) and
+      # grpc.http2.min_time_between_pings_ms both bound how often *this*
+      # side may send a keepalive PING, independently of how often
+      # grpc.keepalive_time_ms would otherwise ask for one.
+      def ping_policing_permits?(now)
+        return false if @max_pings_without_data.positive? &&
+                        @pings_without_data >= @max_pings_without_data
+        return false if @min_time_between_pings &&
+                        @last_ping_sent_at &&
+                        now - @last_ping_sent_at < @min_time_between_pings
+        true
+      end
+
+      def send_keepalive_ping(now)
+        @mu.synchronize { @ping_deadline = now + @keepalive_timeout if @ping_deadline.nil? }
+        @session.ping
+        @pings_without_data += 1
+        @last_ping_sent_at = now
+      rescue StandardError
+        # The write side is already gone; the reader will finish the job.
+        nil
       end
 
       def ping_permitted?

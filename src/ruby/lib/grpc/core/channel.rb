@@ -68,6 +68,28 @@ module GRPC
         @args = ChannelArgs.normalize(channel_args)
         @credentials = resolve_credentials(credentials)
         @parsed_target = Transport.parse_target(target)
+        read_channel_args
+        @mu = Mutex.new
+        @cv = ConditionVariable.new
+        @state = ConnectivityStates::IDLE
+        # One Subchannel per resolved address, plus the policy that picks
+        # among them; nil until #maybe_start_connect resolves the target
+        # for the first time, and again after every address has failed and
+        # #schedule_reresolve_locked has torn the stale set down.
+        @subchannels = nil
+        @lb_policy = nil
+        @resolving = false
+        @resolve_thread = nil
+        @idle_timer = nil
+        @last_error = nil
+        @destroyed = false
+        LIVE[self] = true
+      end
+
+      # Every setting this channel takes from its arguments. Kept apart from
+      # #initialize because the list grows with each feature, and the wiring
+      # is not what a reader of #initialize is there to find.
+      def read_channel_args
         @max_receive_message_length = ChannelArgs.int(
           @args, ChannelArgs::MAX_RECEIVE_MESSAGE_LENGTH,
           ChannelArgs::DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH)
@@ -93,21 +115,14 @@ module GRPC
         @client_idle_timeout = ChannelArgs.seconds(@args, ChannelArgs::CLIENT_IDLE_TIMEOUT_MS)
         @service_config = build_service_config
         @enable_retries_arg = @args[ChannelArgs::ENABLE_RETRIES]
-        @mu = Mutex.new
-        @cv = ConditionVariable.new
-        @state = ConnectivityStates::IDLE
-        # One Subchannel per resolved address, plus the policy that picks
-        # among them; nil until #maybe_start_connect resolves the target
-        # for the first time, and again after every address has failed and
-        # #schedule_reresolve_locked has torn the stale set down.
-        @subchannels = nil
-        @lb_policy = nil
-        @resolving = false
-        @resolve_thread = nil
-        @idle_timer = nil
-        @last_error = nil
-        @destroyed = false
-        LIVE[self] = true
+        @http2_max_pings_without_data = ChannelArgs.int(
+          @args, ChannelArgs::HTTP2_MAX_PINGS_WITHOUT_DATA,
+          Connection::DEFAULT_MAX_PINGS_WITHOUT_DATA)
+        @http2_min_time_between_pings =
+          ChannelArgs.seconds(@args, ChannelArgs::HTTP2_MIN_TIME_BETWEEN_PINGS_MS)
+        @http2_max_ping_strikes = ChannelArgs.int(
+          @args, ChannelArgs::HTTP2_MAX_PING_STRIKES,
+          Connection::DEFAULT_MAX_PING_STRIKES)
       end
 
       def initialize_copy(_other)
@@ -351,6 +366,9 @@ module GRPC
                   keepalive_timeout: @keepalive_timeout,
                   keepalive_permit_without_calls: @keepalive_permit_without_calls,
                   client_idle_timeout: @client_idle_timeout,
+                  max_pings_without_data: @http2_max_pings_without_data,
+                  min_time_between_pings: @http2_min_time_between_pings,
+                  max_ping_strikes: @http2_max_ping_strikes,
                   on_close: on_close)
         connection.start
         # A completed TCP connect is not a usable channel: the peer may have

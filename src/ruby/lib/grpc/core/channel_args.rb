@@ -44,6 +44,9 @@ module GRPC
       DEFAULT_COMPRESSION_ALGORITHM = 'grpc.default_compression_algorithm'
       DEFAULT_COMPRESSION_LEVEL = 'grpc.default_compression_level'
       MAX_METADATA_SIZE = 'grpc.max_metadata_size'
+      HTTP2_MAX_PINGS_WITHOUT_DATA = 'grpc.http2.max_pings_without_data'
+      HTTP2_MIN_TIME_BETWEEN_PINGS_MS = 'grpc.http2.min_time_between_pings_ms'
+      HTTP2_MAX_PING_STRIKES = 'grpc.http2.max_ping_strikes'
       SERVICE_CONFIG = 'grpc.service_config'
       ENABLE_RETRIES = 'grpc.enable_retries'
 
@@ -60,6 +63,9 @@ module GRPC
         DEFAULT_COMPRESSION_ALGORITHM,
         DEFAULT_COMPRESSION_LEVEL,
         ENABLE_HTTP_PROXY,
+        HTTP2_MAX_PINGS_WITHOUT_DATA,
+        HTTP2_MAX_PING_STRIKES,
+        HTTP2_MIN_TIME_BETWEEN_PINGS_MS,
         ENABLE_RETRIES,
         KEEPALIVE_PERMIT_WITHOUT_CALLS,
         KEEPALIVE_TIME_MS,

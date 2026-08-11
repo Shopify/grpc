@@ -29,6 +29,13 @@ class PingCountingSession
     @mu.synchronize { @pings += 1 }
   end
 
+  # Connection#note_data_sent_since_last_ping polls this every tick; a
+  # constant 0 means "no real RPC traffic ever flows" for these fakes,
+  # which is exactly what they simulate.
+  def data_frames_sent
+    0
+  end
+
   def connect; end
 
   def receive; end

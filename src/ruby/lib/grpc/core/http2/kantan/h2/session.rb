@@ -42,6 +42,13 @@ module Kantan
 
       CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".b.freeze
 
+      # grpc.http2.max_ping_strikes: minimum gap between the peer's
+      # successive PINGs, absent anything sent on this side to explain them,
+      # before they count as one of the "misbehaving" pings the argument
+      # limits. Matches C-core's receive-side default when no separate floor
+      # is configured.
+      PING_STRIKE_INTERVAL = 300.0
+
       # grpc: reads frames through one reusable buffer.
       #
       # The frame loop used to call io.read(9) for every header and io.read(n)
@@ -255,7 +262,7 @@ module Kantan
 
       # grpc: max_concurrent_streams is configurable so that a gRPC server can
       # honour grpc.max_concurrent_streams from its channel args.
-      def initialize io, handler:, max_concurrent_streams: 100
+      def initialize io, handler:, max_concurrent_streams: 100, max_ping_strikes: 2
         @name = SecureRandom.uuid
         @io = io
         @handler = handler
@@ -301,6 +308,21 @@ module Kantan
 
         # Server vs client mode (nil until connect/receive is called)
         @server_mode = nil
+
+        # grpc.http2.max_ping_strikes: pings from the peer arriving faster
+        # than PING_STRIKE_INTERVAL apart, with nothing sent on this side to
+        # explain them, count as strikes; exceeding the limit sends GOAWAY
+        # with ENHANCE_YOUR_CALM (see #handle_ping). 0 means unlimited.
+        @max_ping_strikes = max_ping_strikes
+        @ping_strikes = 0
+        @last_ping_received_at = nil
+        # grpc: bumped by #send_headers, #send_data and #send_trailers so
+        # that both #handle_ping (received-side strikes) and the owning
+        # Connection's keepalive policing (grpc.http2.max_pings_without_data)
+        # can tell whether anything real has gone out since they last looked,
+        # without either of them costing a per-message allocation.
+        @data_frames_sent = 0
+        @data_frames_sent_at_last_ping_strike_check = 0
       end
 
       # grpc: one place that knows the Stream layout, and the only place that
@@ -318,7 +340,12 @@ module Kantan
         stream_id
       end
 
+      def data_frames_sent
+        @data_frames_sent
+      end
+
       def send_headers stream_id, headers, has_body: false
+        @data_frames_sent += 1
         @write_queue << [:headers, stream_id, headers, !has_body]
       end
 
@@ -341,12 +368,14 @@ module Kantan
       # exactly that reason.
       def send_data stream_id, data, end_stream: false, ack_to: nil,
                     ack_size: 0
+        @data_frames_sent += 1
         @write_queue << [:grpc_data, stream_id, data, end_stream, ack_to,
                          ack_size]
       end
 
       # grpc: writes the trailing HEADERS block once queued DATA has drained.
       def send_trailers stream_id, headers
+        @data_frames_sent += 1
         @write_queue << [:grpc_trailers, stream_id, headers]
       end
 
@@ -1195,6 +1224,7 @@ module Kantan
         if flags.even?
           # Peer PING: queue ACK for write thread. This payload has to be
           # echoed back, so it is the one PING body that must be copied.
+          check_ping_strikes
           @write_queue << [:ping_ack, io.read(8)]
         else
           # ACK of our PING: compute RTT
@@ -1202,6 +1232,29 @@ module Kantan
           rtt_ns = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond) - sent_at
           @handler.on_ping rtt_ns
         end
+      end
+
+      # grpc.http2.max_ping_strikes: a PING from the peer less than
+      # PING_STRIKE_INTERVAL after the previous one, with nothing sent on
+      # this side in between to explain the traffic, is a strike. Enough
+      # strikes and this side stops humouring the peer and goes away
+      # instead, via the same ConnectionError path #read_loop already uses
+      # for a protocol violation.
+      def check_ping_strikes
+        return if @max_ping_strikes.zero?
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        sent = @data_frames_sent
+        quiet = sent == @data_frames_sent_at_last_ping_strike_check
+        @data_frames_sent_at_last_ping_strike_check = sent
+        if quiet && @last_ping_received_at && (now - @last_ping_received_at) < PING_STRIKE_INTERVAL
+          @ping_strikes += 1
+          if @ping_strikes > @max_ping_strikes
+            raise Errors::EnhanceYourCalm.new("too many misbehaving pings", 0)
+          end
+        else
+          @ping_strikes = 0
+        end
+        @last_ping_received_at = now
       end
 
       def handle_settings io, len, flags, stream_ident
@@ -1251,11 +1304,13 @@ module Kantan
         raise Errors::ProtocolError.new("GOAWAY on non-zero stream", len) unless stream_ident.zero?
         raise Errors::FrameSizeError.new("GOAWAY too short", len) if len < 8
 
-        # Consume last_stream_id and error_code fields to advance the IO position
-        io.skip(8)
+        last_stream_id = io.read_uint32 & 0x7FFF_FFFF
+        error_code = io.read_uint32
 
-        # Read optional debug data
+        # Read and discard optional debug data
         io.skip(len - 8) if len > 8
+
+        @handler.on_goaway last_stream_id, error_code
       end
 
       def handle_window_update io, len, flags, stream_ident

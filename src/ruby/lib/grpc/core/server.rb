@@ -85,6 +85,14 @@ module GRPC
         @max_connection_age = ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_AGE_MS)
         @max_connection_age_grace =
           ChannelArgs.seconds(@args, ChannelArgs::MAX_CONNECTION_AGE_GRACE_MS)
+        @http2_max_pings_without_data = ChannelArgs.int(
+          @args, ChannelArgs::HTTP2_MAX_PINGS_WITHOUT_DATA,
+          Connection::DEFAULT_MAX_PINGS_WITHOUT_DATA)
+        @http2_min_time_between_pings =
+          ChannelArgs.seconds(@args, ChannelArgs::HTTP2_MIN_TIME_BETWEEN_PINGS_MS)
+        @http2_max_ping_strikes = ChannelArgs.int(
+          @args, ChannelArgs::HTTP2_MAX_PING_STRIKES,
+          Connection::DEFAULT_MAX_PING_STRIKES)
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @listeners = []
@@ -243,6 +251,9 @@ module GRPC
                   max_connection_idle: @max_connection_idle,
                   max_connection_age: @max_connection_age,
                   max_connection_age_grace: @max_connection_age_grace,
+                  max_pings_without_data: @http2_max_pings_without_data,
+                  min_time_between_pings: @http2_min_time_between_pings,
+                  max_ping_strikes: @http2_max_ping_strikes,
                   on_new_rpc: method(:enqueue_rpc),
                   on_close: method(:forget_connection))
         # A socket accepted just as the server shuts down is dropped without

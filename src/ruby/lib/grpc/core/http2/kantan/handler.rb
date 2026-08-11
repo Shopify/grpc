@@ -29,6 +29,10 @@ module Kantan
     def on_stream_error stream, error_code; end
     def on_settings settings; end
     def on_ping rtt; end
+    # grpc: called once for an inbound GOAWAY, after the frame's fields have
+    # been parsed; +last_stream_id+ is the highest stream id the peer will
+    # still process.
+    def on_goaway last_stream_id, error_code; end
     def on_close; end
   end
 end

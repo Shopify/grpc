@@ -54,6 +54,15 @@ module Kantan
       end
     end
 
+    # grpc: raised when a receiver decides a peer's PINGs are abusive
+    # (grpc.http2.max_ping_strikes exceeded), so this side sends GOAWAY and
+    # tears the connection down rather than keep answering them.
+    class EnhanceYourCalm < ConnectionError
+      def initialize msg, remaining
+        super(msg, remaining, 0xb)
+      end
+    end
+
     class StreamError < Error
       attr_reader :stream_id, :error_code, :remaining
 
