@@ -500,6 +500,20 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   never names an `xds:` target; loading them on demand put that metric back
   on the null floor. Neither shows up in a profile of the RPC path: one is
   lock contention, the other is GC pressure.
+- The pair count is not stable either, below a few per cent. Two 16-pair
+  runs of the same batch against the same base gave `unary_empty` at 9 of
+  16 and then 2 of 16, and `unary_large` at 5 of 16 and then 3 of 16. When
+  two runs of identical code disagree that far, the honest reading is that
+  this harness cannot resolve an effect of that size, not that the second
+  run found something. Raise the pair count or change the question; do not
+  pick the run that agrees with you.
+- BDP probing was implemented and measured and does nothing here. The
+  growth ceiling is `max(RECEIVE_WINDOW, lookahead_bytes)` and
+  `grpc.http2.lookahead_bytes` defaults to 64 KiB, well under the 1 MiB
+  window this core already advertises, so a probe never arms unless a
+  caller raises the argument past 1 MiB. It confirms rather than overturns
+  the diagnosis below: the 64 KiB unary deficit is in the delay between
+  queueing a frame and the write thread writing it, not in flow control.
 
 ## Known gaps
 
@@ -527,10 +541,22 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   time a target names the `xds` scheme. Do not require `xds_client.rb`
   from anything that loads eagerly; see the performance note above for
   what that cost.
-- Health checking implements `Check`. There is no `Watch`, which upstream
-  Ruby does not implement either, and no server reflection or channelz;
-  the C extension exposed none of the three to Ruby, so they were never
-  parity gaps.
+- Load balancing offers `pick_first`, `round_robin`, `ring_hash` and
+  `weighted_round_robin`, with outlier detection available as a wrapper
+  over any of them and gRFC A17 health checking per subchannel. There is
+  no grpclb, and no custom-policy registry for callers to add their own.
+- The shipped health checker implements `Check` only. Client-side health
+  checking drives the `Watch` RPC against a backend that offers it, and
+  falls open when a backend does not, but this core's own servicer still
+  has no `Watch`, which is what upstream Ruby ships. There is no server
+  reflection and no channelz; the C extension exposed neither to Ruby, so
+  they were never parity gaps.
+- A leaked thread is a production bug here, not a test nuisance. Two were
+  found by instrumenting `Thread.list` across the suite: `ClientStub` had
+  no way to close a channel it opened for itself, where the C extension
+  freed the channel from a GC callback, and every xDS stream reconnect
+  left its write pump polling a queue nobody would ever push to. Anything
+  that starts a thread needs an owner that joins it.
 - `GRPC::Core::CompressionOptions` is honoured for channel arguments.
   A server does not compress a response unless the client asked for an
   algorithm.
