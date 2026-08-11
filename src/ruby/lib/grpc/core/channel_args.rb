@@ -58,6 +58,8 @@ module GRPC
       EXPERIMENTAL_ENABLE_HEDGING = 'grpc.experimental.enable_hedging'
       HTTP_PROXY = 'grpc.http_proxy'
       ADDRESS_HTTP_PROXY = 'grpc.address_http_proxy'
+      INHIBIT_HEALTH_CHECKING = 'grpc.inhibit_health_checking'
+      RING_HASH_LB_RING_SIZE_CAP = 'grpc.lb.ring_hash.ring_size_cap'
       SERVICE_CONFIG = 'grpc.service_config'
       ENABLE_RETRIES = 'grpc.enable_retries'
 
@@ -83,10 +85,12 @@ module GRPC
         HTTP2_MAX_PINGS_WITHOUT_DATA,
         HTTP2_MIN_TIME_BETWEEN_PINGS_MS,
         HTTP_PROXY,
+        INHIBIT_HEALTH_CHECKING,
         INITIAL_RECONNECT_BACKOFF_MS,
         KEEPALIVE_PERMIT_WITHOUT_CALLS,
         KEEPALIVE_TIME_MS,
         KEEPALIVE_TIMEOUT_MS,
+        RING_HASH_LB_RING_SIZE_CAP,
         LB_POLICY_NAME,
         MAX_CONCURRENT_STREAMS,
         MAX_CONNECTION_AGE_GRACE_MS,

@@ -45,7 +45,11 @@ module GRPC
       # has no real network host/port of its own -- #path carries the
       # resource name instead, and #host mirrors it so TLS hostname
       # verification has something to check when no override is given.
-      Target = Struct.new(:scheme, :host, :port, :path, :addresses) do
+      # +weight+ is nil except for an EDS-resolved :xds endpoint, where it
+      # carries the LbEndpoint's load_balancing_weight for the
+      # ring_hash/weighted_round_robin LB policies; every other resolver
+      # leaves it nil and those policies treat that as weight 1.
+      Target = Struct.new(:scheme, :host, :port, :path, :addresses, :weight) do
         def to_peer
           return "unix:#{path}" if scheme == :unix
           family = host.include?(':') ? 'ipv6' : 'ipv4'

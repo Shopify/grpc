@@ -417,7 +417,8 @@ module GRPC
       def target_of(lb_endpoint)
         socket_address = lb_endpoint.endpoint&.address&.socket_address
         return nil if socket_address.nil?
-        Transport::Target.new(:tcp, socket_address.address, socket_address.port_value, nil)
+        Transport::Target.new(:tcp, socket_address.address, socket_address.port_value, nil,
+                              nil, lb_endpoint.load_balancing_weight&.value)
       end
 
       # ---- The ADS stream itself: connect, drive request/response, and on
@@ -446,12 +447,26 @@ module GRPC
           @request_queue = queue
           RESOURCE_CLASSES.each_key { |type_url| send_request_locked(type_url) unless @subscribed[type_url].empty? }
         end
+        # A fresh Channel per attempt, since the reconnect backoff picks up
+        # where a dropped stream left off. Leaving it open past this attempt
+        # would leak its connection-maintenance thread on every reconnect.
         stub = GRPC::ClientStub.new(@server_uri, @channel_creds)
-        requests = Enumerator.new { |y| pump_requests(queue, y) }
-        marshal = ->(msg) { msg.class.encode(msg) }
-        unmarshal = ->(bytes) { Envoy::Service::Discovery::V3::DiscoveryResponse.decode(bytes) }
-        responses = stub.bidi_streamer(ADS_METHOD, requests, marshal, unmarshal)
-        responses.each { |response| handle_response(response) }
+        begin
+          requests = Enumerator.new { |y| pump_requests(queue, y) }
+          marshal = ->(msg) { msg.class.encode(msg) }
+          unmarshal = ->(bytes) { Envoy::Service::Discovery::V3::DiscoveryResponse.decode(bytes) }
+          responses = stub.bidi_streamer(ADS_METHOD, requests, marshal, unmarshal)
+          responses.each { |response| handle_response(response) }
+        ensure
+          # #close's own :stop only reaches whichever attempt's queue is
+          # still @request_queue; a stream that ends on its own (an error,
+          # or the peer closing) needs *this* attempt's queue told to stop
+          # too, or the write thread bidi_streamer started for it keeps
+          # polling an orphaned queue forever -- one leaked thread per
+          # reconnect, for as long as the process runs.
+          queue.push(:stop)
+          stub.close
+        end
       ensure
         @mu.synchronize { @request_queue = nil if @request_queue.equal?(queue) }
       end

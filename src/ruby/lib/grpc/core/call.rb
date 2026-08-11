@@ -408,6 +408,11 @@ module GRPC
       def op_recv_status(result)
         ensure_started
         result.status = resolve_client_status
+        # The only place a client call's outcome is known for every path
+        # (trailers, cancellation, transport failure, deadline): see
+        # OutlierDetection::CallCounter for why this is a bare integer bump
+        # with no lock.
+        @connection&.outlier_counter&.record(result.status.code == StatusCodes::OK)
         @finished = true
       end
 
@@ -429,13 +434,17 @@ module GRPC
         # CompressionOptions reaches a call.
         requested = md.delete(MetadataKeys::COMPRESSION_REQUEST_ALGORITHM) ||
                     @channel.default_compression_algorithm
+        # Left in +md+, unlike the compression key above: ring_hash reads it
+        # for consistent hashing, but it is still an ordinary application
+        # header the server should see too.
+        hash_key = md[MetadataKeys::RING_HASH_KEY]
         credential_headers = call_credentials_headers
         return if failed?
         # Metadata errors are the caller's fault and must surface as-is, so
         # they are raised before anything touching the transport.
         headers = build_request_headers(md, requested).concat(credential_headers)
         begin
-          @stream = @channel.open_stream(deadline: @monotonic_deadline)
+          @stream = @channel.open_stream(deadline: @monotonic_deadline, hash_key: hash_key)
           @connection = @stream.connection
           @peer = @stream.peer
           @peer_cert = @stream.peer_cert

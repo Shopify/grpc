@@ -329,6 +329,37 @@ describe 'xds' do
     end
   end
 
+  it 'does not leak the ADS stream connection past a reconnect' do
+    start_management_server do
+      configure_bootstrap
+      @management.on(XDS_LDS, &ack_only_responder(XDS_LDS, listener_resource, version: 'v1', nonce: 'n-lds-1'))
+      @management.on(XDS_RDS, &ack_only_responder(XDS_RDS, route_config_resource, version: 'v1', nonce: 'n-rds-1'))
+      @management.on(XDS_CDS, &ack_only_responder(XDS_CDS, cluster_resource, version: 'v1', nonce: 'n-cds-1'))
+      @management.on(XDS_EDS, &ack_only_responder(XDS_EDS, endpoint_resource(port: 21_004), version: 'v1', nonce: 'n-eds-1'))
+
+      target = GRPC::Core::Transport.parse_target("xds:///#{XDS_LISTENER_NAME}")
+      GRPC::Core::Transport.resolve_addresses(target)
+      # The baseline is "after one ADS stream has run and settled", not the
+      # process-wide count, since one-time costs like the stdlib Timeout
+      # thread only appear once, however many streams follow.
+      sleep 0.1 # let the first stream's threads settle
+      after_first_stream = Thread.list.size
+
+      drop_management_connection
+      wait_until(timeout: 15) { @management.stream_count >= 2 }
+      # Each reconnect opens its own ClientStub for the ADS bidi stream; one
+      # left unclosed keeps that channel's maintenance thread running
+      # forever, so a second stream must not cost more than the first did,
+      # once its predecessor has had time to close.
+      wait_until(timeout: 2) { Thread.list.size <= after_first_stream }
+      expect(Thread.list.size).to eq(after_first_stream)
+
+      GRPC::Core::XdsClient.reset_for_testing!
+      wait_until(timeout: 2) { Thread.list.size < after_first_stream }
+      expect(Thread.list.size).to be < after_first_stream
+    end
+  end
+
   describe 'bootstrap errors' do
     it 'fails channel construction when neither bootstrap env var is set' do
       expect { GRPC::Core::Channel.new('xds:///svc', {}, :this_channel_is_insecure) }

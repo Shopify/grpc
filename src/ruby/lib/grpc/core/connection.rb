@@ -59,6 +59,12 @@ module GRPC
       # features sharing the thread do not lose precision to each other.
       MAINTENANCE_POLL_INTERVAL = 0.005
 
+      # Set by Subchannel#connect_worker right after a successful dial, to
+      # whatever CallCounter OutlierDetectionPolicy gave that address (nil
+      # when outlier detection is not configured). Call#op_recv_status bumps
+      # it once per finished client RPC; nothing else touches it.
+      attr_accessor :outlier_counter
+
       attr_reader :session, :peer, :peer_cert
 
       # rubocop:disable Metrics/ParameterLists -- all but +io+ are keywords

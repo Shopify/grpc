@@ -15,6 +15,7 @@
 # limitations under the License.
 
 require 'json'
+require_relative 'outlier_detection'
 require_relative 'status_codes'
 
 module GRPC
@@ -42,11 +43,19 @@ module GRPC
       # the other vs. several in parallel) and combining them isn't defined.
       HedgingPolicy = Struct.new(:max_attempts, :hedging_delay, :non_fatal_status_codes)
 
+      # gRFC A17 client-side health checking: +service_name+ is what
+      # HealthWatcher asks grpc.health.v1.Health/Watch about on each
+      # subchannel. Nil (no healthCheckConfig in the document) leaves
+      # health checking off, same as grpc.inhibit_health_checking would.
+      HealthCheckConfig = Struct.new(:service_name)
+
       # Maps the enum names service config JSON uses ("UNAVAILABLE", ...) to
       # the integers this core's status codes are compared as.
       STATUS_CODES_BY_NAME = StatusCodes.constants.each_with_object({}) do |name, acc|
         acc[name.to_s] = StatusCodes.const_get(name)
       end.freeze
+
+      attr_reader :health_check_config, :outlier_detection
 
       # @param json [String] a service config document
       # @raise [ArgumentError] naming grpc.service_config, on anything the
@@ -56,6 +65,8 @@ module GRPC
         @by_exact_method = {} # "pkg.Svc/Method" => MethodConfig
         @by_service = {}      # "pkg.Svc"        => MethodConfig
         @default = nil        # MethodConfig, from a {} name entry
+        @health_check_config = nil
+        @outlier_detection = nil
         parse(parse_json(json))
       end
 
@@ -81,6 +92,76 @@ module GRPC
           raise ArgumentError, 'grpc.service_config must be a JSON object'
         end
         Array(doc['methodConfig']).each { |cfg| parse_method_config(cfg) }
+        @health_check_config = parse_health_check_config(doc['healthCheckConfig'])
+        @outlier_detection = parse_outlier_detection(doc['outlierDetection'])
+      end
+
+      def parse_health_check_config(cfg)
+        return nil if cfg.nil?
+        unless cfg.is_a?(Hash)
+          raise ArgumentError, 'grpc.service_config: healthCheckConfig must be an object'
+        end
+        name = cfg['serviceName']
+        return nil unless name.is_a?(String)
+        HealthCheckConfig.new(name)
+      end
+
+      # childPolicy is not consulted here: Channel already chose the child
+      # LB policy from grpc.lb_policy_name before OutlierDetectionPolicy
+      # ever wraps it (see Channel#build_subchannels_locked), and this
+      # implementation has no separate loadBalancingConfig selection
+      # mechanism for outlierDetection's childPolicy field to feed.
+      def parse_outlier_detection(cfg)
+        return nil if cfg.nil?
+        unless cfg.is_a?(Hash)
+          raise ArgumentError, 'grpc.service_config: outlierDetection must be an object'
+        end
+        OutlierDetection::Config.new(
+          interval: parse_duration(cfg['interval']) || 10.0,
+          base_ejection_time: parse_duration(cfg['baseEjectionTime']) || 30.0,
+          max_ejection_time: parse_duration(cfg['maxEjectionTime']) || 300.0,
+          max_ejection_percent: cfg['maxEjectionPercent'] || 10,
+          **parse_success_rate_ejection(cfg['successRateEjection']),
+          **parse_failure_percentage_ejection(cfg['failurePercentageEjection'])
+        )
+      rescue TypeError, ArgumentError => e
+        raise ArgumentError, "grpc.service_config has a malformed outlierDetection: #{e.message}"
+      end
+
+      # nil for every field disables the success-rate algorithm entirely
+      # (see OutlierDetectionPolicy#evaluate) -- absence of the sub-message
+      # is not the same as an empty one, which enables it with defaults.
+      def parse_success_rate_ejection(cfg)
+        if cfg.nil?
+          return { success_rate_stdev_factor: nil, success_rate_enforcement_percentage: nil,
+                   success_rate_minimum_hosts: nil, success_rate_request_volume: nil }
+        end
+        unless cfg.is_a?(Hash)
+          raise ArgumentError, 'successRateEjection must be an object'
+        end
+        {
+          success_rate_stdev_factor: cfg['stdevFactor'] || 1900,
+          success_rate_enforcement_percentage: cfg['enforcementPercentage'] || 100,
+          success_rate_minimum_hosts: cfg['minimumHosts'] || 5,
+          success_rate_request_volume: cfg['requestVolume'] || 100
+        }
+      end
+
+      # Same nil-disables-the-algorithm rule as #parse_success_rate_ejection.
+      def parse_failure_percentage_ejection(cfg)
+        if cfg.nil?
+          return { failure_percentage_threshold: nil, failure_percentage_enforcement_percentage: nil,
+                   failure_percentage_minimum_hosts: nil, failure_percentage_request_volume: nil }
+        end
+        unless cfg.is_a?(Hash)
+          raise ArgumentError, 'failurePercentageEjection must be an object'
+        end
+        {
+          failure_percentage_threshold: cfg['threshold'] || 85,
+          failure_percentage_enforcement_percentage: cfg['enforcementPercentage'] || 100,
+          failure_percentage_minimum_hosts: cfg['minimumHosts'] || 5,
+          failure_percentage_request_volume: cfg['requestVolume'] || 50
+        }
       end
 
       def parse_method_config(cfg)

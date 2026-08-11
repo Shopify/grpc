@@ -21,6 +21,7 @@ require_relative 'connection'
 require_relative 'constants'
 require_relative 'credentials'
 require_relative 'lb_policy'
+require_relative 'outlier_detection'
 require_relative 'reconnect_backoff'
 require_relative 'service_config'
 require_relative 'subchannel'
@@ -86,6 +87,10 @@ module GRPC
         @resolving = false
         @resolve_thread = nil
         @idle_timer = nil
+        # Owned by, and only ever running while, the OutlierDetectionPolicy
+        # it was started for is still @lb_policy -- see
+        # #start_outlier_detection_timer_locked and #stop_outlier_detection_timer.
+        @outlier_detection_timer = nil
         @last_error = nil
         @destroyed = false
         LIVE[self] = true
@@ -133,6 +138,9 @@ module GRPC
           Connection::DEFAULT_MAX_PING_STRIKES)
         @per_message_compression = !ChannelArgs.int(
           @args, ChannelArgs::PER_MESSAGE_COMPRESSION, 1
+        ).zero?
+        @inhibit_health_checking = !ChannelArgs.int(
+          @args, ChannelArgs::INHIBIT_HEALTH_CHECKING, 0
         ).zero?
       end
 
@@ -240,15 +248,19 @@ module GRPC
 
       def destroy
         subchannels = nil
+        outlier_timer = nil
         @mu.synchronize do
           return nil if @destroyed
           @destroyed = true
           subchannels = @subchannels
           @subchannels = nil
           @lb_policy = nil
+          outlier_timer = @outlier_detection_timer
+          @outlier_detection_timer = nil
           @state = ConnectivityStates::FATAL_FAILURE
           @cv.broadcast
         end
+        stop_outlier_detection_timer(outlier_timer)
         subchannels&.each(&:close)
         nil
       end
@@ -257,8 +269,8 @@ module GRPC
       # Opens a stream for a new RPC, connecting first if necessary.
       #
       # @api private
-      def open_stream(deadline: nil)
-        connection = await_connection(deadline)
+      def open_stream(deadline: nil, hash_key: nil)
+        connection = await_connection(deadline, hash_key)
         connection.open_rpc
       end
 
@@ -277,6 +289,9 @@ module GRPC
         @resolving = false
         @resolve_thread = nil
         @idle_timer = nil
+        # Not woken/joined: a fork leaves no threads behind in the child,
+        # only the ivar naming one that no longer exists.
+        @outlier_detection_timer = nil
         @last_error = nil
         @state = ConnectivityStates::IDLE unless @destroyed
         subchannels&.each(&:abandon)
@@ -421,13 +436,20 @@ module GRPC
 
       # Runs the DNS lookup off the lock, exactly as dialing a socket always
       # has, since a slow resolver must not stall every other channel
-      # operation.
+      # operation. #effective_health_check_service_name is resolved here
+      # too, off the lock, for the same reason #effective_service_config
+      # itself defers a resolver-supplied config's DNS TXT lookup out of
+      # #initialize: this thread is already paying for one DNS round trip,
+      # and every Subchannel #build_subchannels_locked is about to create
+      # needs the answer before it can decide whether to health-check.
       def resolve_worker
         addresses = Transport.resolve_addresses(@parsed_target, @args)
+        health_check_service_name = effective_health_check_service_name
+        outlier_detection_config = effective_service_config&.outlier_detection
         policy = @mu.synchronize do
           @resolving = false
           next nil if @destroyed
-          build_subchannels_locked(addresses)
+          build_subchannels_locked(addresses, health_check_service_name, outlier_detection_config)
           @lb_policy
         end
         policy&.maybe_connect
@@ -442,14 +464,38 @@ module GRPC
         end
       end
 
-      def build_subchannels_locked(addresses)
-        @subchannels = addresses.map { |address| new_subchannel(address) }
-        @lb_policy = LB_POLICIES.fetch(@lb_policy_name).new(@subchannels)
+      # grpc.inhibit_health_checking turns the feature off outright;
+      # otherwise the applicable service config's healthCheckConfig names
+      # the service to watch, or nil for none, exactly as
+      # #effective_service_config already orders grpc.service_config ahead
+      # of whatever a resolver supplied.
+      def effective_health_check_service_name
+        return nil if @inhibit_health_checking
+        effective_service_config&.health_check_config&.service_name
       end
 
-      def new_subchannel(address)
+      # Wraps the child LB_POLICIES entry in an OutlierDetectionPolicy, and
+      # starts the one timer that drives it, exactly when +config+ is
+      # non-nil -- i.e. the applicable service config carried an
+      # outlierDetection object. A prior epoch's timer is always already
+      # stopped by whichever of #destroy/#schedule_reresolve_locked tore
+      # its subchannels down, so @outlier_detection_timer is nil here.
+      def build_subchannels_locked(addresses, health_check_service_name, config)
+        @subchannels = addresses.map { |address| new_subchannel(address, health_check_service_name) }
+        child = LB_POLICIES.fetch(@lb_policy_name).new(@subchannels, @args)
+        if config.nil?
+          @lb_policy = child
+        else
+          @lb_policy = OutlierDetectionPolicy.new(@subchannels, child, config)
+          start_outlier_detection_timer_locked(@lb_policy, config.interval)
+        end
+      end
+
+      def new_subchannel(address, health_check_service_name)
         Subchannel.new(address, dial: method(:build_connection_for),
-                                on_state_change: method(:on_subchannel_state_changed))
+                                on_state_change: method(:on_subchannel_state_changed),
+                                health_check_service_name: health_check_service_name,
+                                health_backoff_factory: method(:build_backoff))
       end
 
       # Dials +address+, one of the addresses #resolve_addresses returned
@@ -514,19 +560,48 @@ module GRPC
         delay = @backoff.next_delay
         @idle_timer = Thread.new do
           sleep delay
-          subchannels = @mu.synchronize do
+          subchannels, outlier_timer = @mu.synchronize do
             @idle_timer = nil
-            next nil if @destroyed
-            next nil unless @lb_policy.connectivity_state == ConnectivityStates::TRANSIENT_FAILURE
+            next [nil, nil] if @destroyed
+            next [nil, nil] unless @lb_policy.connectivity_state == ConnectivityStates::TRANSIENT_FAILURE
             stale = @subchannels
+            timer = @outlier_detection_timer
             @subchannels = nil
             @lb_policy = nil
+            @outlier_detection_timer = nil
             transition_locked(ConnectivityStates::IDLE)
-            stale
+            [stale, timer]
           end
+          stop_outlier_detection_timer(outlier_timer)
           subchannels&.each(&:close)
         end
         @idle_timer.name = 'grpc-reresolve'
+      end
+
+      def start_outlier_detection_timer_locked(policy, interval)
+        @outlier_detection_timer = Thread.new { outlier_detection_worker(policy, interval) }
+        @outlier_detection_timer.name = 'grpc-outlier-detection'
+      end
+
+      # Runs until +policy+ stops being @lb_policy -- torn down by #destroy
+      # or #schedule_reresolve_locked's re-resolve, both of which also call
+      # #stop_outlier_detection_timer to wake this early rather than making
+      # ejected addresses wait out a stale timer's last +interval+.
+      def outlier_detection_worker(policy, interval)
+        until @mu.synchronize { !@lb_policy.equal?(policy) }
+          sleep interval
+          break if @mu.synchronize { !@lb_policy.equal?(policy) }
+          policy.evaluate
+        end
+      end
+
+      # The loop above wakes on its own interval, so tearing it down only
+      # has to clear @lb_policy (already done by the caller) and wait for
+      # it to notice; #wakeup cuts that wait down from the full interval.
+      def stop_outlier_detection_timer(thread)
+        return if thread.nil? || thread == Thread.current
+        thread.wakeup if thread.alive?
+        thread.join(1)
       end
 
       # READY means some subchannel just dialed successfully, so the next
@@ -541,10 +616,10 @@ module GRPC
 
       # Blocks until a live connection exists, raising the connect error when
       # the attempt fails so that Call can turn it into an UNAVAILABLE status.
-      def await_connection(deadline)
+      def await_connection(deadline, hash_key = nil)
         limit = deadline || (RpcStream.now + Transport::DEFAULT_CONNECT_TIMEOUT)
         loop do
-          kind, value = @mu.synchronize { pick_or_error_locked }
+          kind, value = @mu.synchronize { pick_or_error_locked(hash_key) }
           return value.connection if kind == :ready
           raise value if kind == :error
           maybe_start_connect
@@ -556,9 +631,9 @@ module GRPC
 
       # Must be called with @mu held. Returns the subchannel to use, the error
       # to raise, or nothing when the caller should wait and look again.
-      def pick_or_error_locked
+      def pick_or_error_locked(hash_key)
         fail Connection::Closed, 'channel closed' if @destroyed
-        subchannel = @lb_policy&.pick
+        subchannel = @lb_policy&.pick(hash_key)
         return [:ready, subchannel] if subchannel
         return nil unless @state == ConnectivityStates::TRANSIENT_FAILURE && @last_error
         error = @last_error

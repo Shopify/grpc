@@ -61,9 +61,16 @@ module GRPC
       }.freeze
     end
 
-    # Metadata keys that gRPC interprets rather than transmits verbatim.
+    # Metadata keys that gRPC interprets rather than transmits verbatim, plus
+    # ones it reads for its own purposes while still forwarding them to the
+    # server as ordinary metadata.
     module MetadataKeys
       COMPRESSION_REQUEST_ALGORITHM = 'grpc-internal-encoding-request'
+      # ring_hash's consistent-hash key. Named with an "x-" prefix, not a
+      # "grpc-" one, because "grpc-" is reserved for the wire protocol itself
+      # (see metadata.rb's CLIENT_RESERVED) and this is an ordinary
+      # application header that ring_hash additionally reads client-side.
+      RING_HASH_KEY = 'x-grpc-hash-key'
     end
 
     # Channel connectivity states. Mirrors grpc_connectivity_state.
