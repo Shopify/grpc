@@ -61,6 +61,12 @@ module GRPC
       # How often shutdown re-checks whether the last RPC has finished.
       DRAIN_POLL_INTERVAL = 0.005
 
+      # grpc.server.max_pending_requests: C-core's own default soft limit.
+      DEFAULT_MAX_PENDING_REQUESTS = 1000
+
+      # grpc.server_handshake_timeout_ms: C-core's own default.
+      DEFAULT_HANDSHAKE_TIMEOUT = 120.0
+
       def initialize(channel_args)
         @args = ChannelArgs.normalize(channel_args)
         @max_receive_message_length = ChannelArgs.int(
@@ -95,6 +101,15 @@ module GRPC
         @http2_max_ping_strikes = ChannelArgs.int(
           @args, ChannelArgs::HTTP2_MAX_PING_STRIKES,
           Connection::DEFAULT_MAX_PING_STRIKES)
+        @max_pending_requests = ChannelArgs.int(
+          @args, ChannelArgs::SERVER_MAX_PENDING_REQUESTS,
+          DEFAULT_MAX_PENDING_REQUESTS)
+        @handshake_timeout = ChannelArgs.seconds(
+          @args, ChannelArgs::SERVER_HANDSHAKE_TIMEOUT_MS) ||
+                             DEFAULT_HANDSHAKE_TIMEOUT
+        @expand_wildcard_addrs = !ChannelArgs.int(
+          @args, ChannelArgs::EXPAND_WILDCARD_ADDRS, 0
+        ).zero?
         @mu = Mutex.new
         @cv = ConditionVariable.new
         @listeners = []
@@ -111,12 +126,22 @@ module GRPC
              'Copy initialization of GRPC::Core::Server is not supported'
       end
 
-      # Binds +addr+ and returns the port that was actually bound.
+      # Binds +addr+ and returns the port that was actually bound. Normally
+      # one socket; grpc.expand_wildcard_addrs turns a single wildcard host
+      # into one socket per concrete local address, all on the same port.
       def add_http2_port(addr, credentials)
         fail 'destroyed!' if @destroyed || @shutdown
         server_creds = resolve_credentials(credentials)
-        listener, port = Transport.listen(addr, so_reuseport: @so_reuseport)
-        @mu.synchronize { @listeners << [listener, server_creds] }
+        listeners = Transport.listen(
+          addr, so_reuseport: @so_reuseport,
+                expand_wildcard_addrs: @expand_wildcard_addrs)
+        port = listeners.first.last
+        @mu.synchronize do
+          # rubocop:disable Style/HashEachMethods -- listeners is an Array of
+          # [socket, port] pairs, not a Hash; each_key does not exist on it.
+          listeners.each { |listener, _port| @listeners << [listener, server_creds] }
+          # rubocop:enable Style/HashEachMethods
+        end
         port
       rescue SystemCallError => e
         fail "could not add port #{addr} to server, not sure why: #{e.message}"
@@ -256,6 +281,7 @@ module GRPC
                   max_pings_without_data: @http2_max_pings_without_data,
                   min_time_between_pings: @http2_min_time_between_pings,
                   max_ping_strikes: @http2_max_ping_strikes,
+                  handshake_timeout: @handshake_timeout,
                   on_new_rpc: method(:enqueue_rpc),
                   on_close: method(:forget_connection))
         # A socket accepted just as the server shuts down is dropped without
@@ -312,6 +338,8 @@ module GRPC
         @mu.synchronize do
           if @shutdown || @destroyed
             stream.reset(7) # REFUSED_STREAM
+          elsif @pending.size >= @max_pending_requests
+            reject_pending_overflow(stream)
           else
             @pending << rpc
             @cv.broadcast
@@ -344,6 +372,26 @@ module GRPC
            ['grpc-message',
             "Received metadata size exceeds #{arg} " \
             "(#{size} vs. #{@absolute_max_metadata_size})"]],
+          end_stream: true)
+        stream.connection.forget(stream.id)
+      rescue Http2::Kantan::Errors::Error, IOError, SystemCallError
+        nil
+      end
+
+      # grpc.server.max_pending_requests: once #request_call cannot keep up
+      # and the accepted-but-unhandled queue is already this deep, a further
+      # RPC is answered RESOURCE_EXHAUSTED -- the same trailers-only shape
+      # #reject_oversized_metadata sends -- instead of growing @pending
+      # without bound or leaving the stream to time out. Checked in the same
+      # critical section that would otherwise push onto @pending, so the
+      # queue never grows past the limit.
+      def reject_pending_overflow(stream)
+        stream.send_headers(
+          [[':status', '200'], ['content-type', 'application/grpc'],
+           ['grpc-status', StatusCodes::RESOURCE_EXHAUSTED.to_s],
+           ['grpc-message',
+            "Too many pending requests for server, grpc.server.max_pending_requests " \
+            "(#{@pending.size} vs. #{@max_pending_requests})"]],
           end_stream: true)
         stream.connection.forget(stream.id)
       rescue Http2::Kantan::Errors::Error, IOError, SystemCallError

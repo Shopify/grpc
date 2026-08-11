@@ -50,6 +50,13 @@ class PingPolicingSession
   def receive; end
   def shutdown; end
 
+  # Connection#close asks the session whether its reader and writer threads
+  # ever started, so it knows whether a queued shutdown will actually drain.
+  # These fakes have no threads, so the socket path is the honest answer.
+  def running?
+    false
+  end
+
   def new_stream
     1
   end

@@ -403,15 +403,77 @@ module GRPC
       # Binds a listening socket for +addr+ ("host:port"); port 0 picks one.
       #
       # @return [Array(TCPServer, Integer)] the listener and the bound port
-      def listen(addr, so_reuseport: false)
+      # Wildcard hosts grpc.expand_wildcard_addrs treats as needing
+      # expansion into every concrete local address of that family, rather
+      # than left as the one socket the kernel would otherwise route every
+      # local address to on its own.
+      WILDCARD_HOSTS = ['0.0.0.0', '::'].freeze
+
+      # Binds a listening socket for +addr+ ("host:port"); port 0 picks one.
+      # Normally one socket. grpc.expand_wildcard_addrs turns a wildcard
+      # host into one socket per concrete local address of that family,
+      # sharing the port the first one bound (or was given).
+      #
+      # @return [Array<Array(TCPServer, Integer)>] one [listener, port] pair
+      #   per bound socket
+      def listen(addr, so_reuseport: false, expand_wildcard_addrs: false)
         target = parse_target(addr)
-        return [UNIXServer.new(target.path), 0] if target.scheme == :unix
-        server = TCPServer.new(target.host, target.port)
+        return [[UNIXServer.new(target.path), 0]] if target.scheme == :unix
+        if expand_wildcard_addrs && WILDCARD_HOSTS.include?(target.host)
+          return listen_expanded(target, so_reuseport)
+        end
+        [listen_one(target.host, target.port, so_reuseport)]
+      end
+
+      def listen_one(host, port, so_reuseport)
+        server = TCPServer.new(host, port)
         server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1)
         if so_reuseport && Socket.const_defined?(:SO_REUSEPORT)
           server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEPORT, 1)
         end
         [server, server.addr[1]]
+      end
+
+      # Binds every concrete local address of +target.host+'s family instead
+      # of the one wildcard socket, so the server reports (and, if a
+      # firewall or NIC drops the wildcard route, actually accepts on) each
+      # address individually. The first successful bind picks the port when
+      # +target.port+ is 0; every other address reuses exactly that port.
+      # An address present in the interface list but not actually bindable
+      # (e.g. a VPN address with no local listening stack) is skipped rather
+      # than failing the whole call, the way grpc_tcp_server_add_port does.
+      # Every concrete address bound to a local interface of +family+, once
+      # each. A link-local IPv6 address carries a "%scope" suffix that
+      # TCPServer.new does not accept back as a host.
+      def local_addresses(family)
+        Socket.getifaddrs.each_with_object([]) do |ifaddr, hosts|
+          addr = ifaddr.addr
+          next if addr.nil? || addr.afamily != family
+          ip = addr.ip_address.split('%').first
+          hosts << ip unless hosts.include?(ip)
+        end
+      end
+
+      def listen_expanded(target, so_reuseport)
+        family = target.host.include?(':') ? Socket::AF_INET6 : Socket::AF_INET
+        hosts = local_addresses(family)
+        if hosts.empty?
+          fail SocketError, "no local address found to expand #{target.host}"
+        end
+        port = target.port
+        listeners = hosts.each_with_object([]) do |host, acc|
+          begin
+            entry = listen_one(host, port, so_reuseport)
+          rescue SystemCallError
+            next
+          end
+          port = entry.last
+          acc << entry
+        end
+        if listeners.empty?
+          fail SocketError, "could not bind any local address to expand #{target.host}"
+        end
+        listeners
       end
 
       def peer_of(socket)

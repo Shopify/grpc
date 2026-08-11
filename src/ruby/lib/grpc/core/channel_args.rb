@@ -48,6 +48,9 @@ module GRPC
       HTTP2_MIN_TIME_BETWEEN_PINGS_MS = 'grpc.http2.min_time_between_pings_ms'
       HTTP2_MAX_PING_STRIKES = 'grpc.http2.max_ping_strikes'
       INHIBIT_HEALTH_CHECKING = 'grpc.inhibit_health_checking'
+      EXPAND_WILDCARD_ADDRS = 'grpc.expand_wildcard_addrs'
+      SERVER_HANDSHAKE_TIMEOUT_MS = 'grpc.server_handshake_timeout_ms'
+      SERVER_MAX_PENDING_REQUESTS = 'grpc.server.max_pending_requests'
       INITIAL_RECONNECT_BACKOFF_MS = 'grpc.initial_reconnect_backoff_ms'
       MIN_RECONNECT_BACKOFF_MS = 'grpc.min_reconnect_backoff_ms'
       MAX_RECONNECT_BACKOFF_MS = 'grpc.max_reconnect_backoff_ms'
@@ -84,6 +87,7 @@ module GRPC
         DNS_ENABLE_SRV_QUERIES,
         ENABLE_HTTP_PROXY,
         ENABLE_RETRIES,
+        EXPAND_WILDCARD_ADDRS,
         EXPERIMENTAL_ENABLE_HEDGING,
         HTTP2_BDP_PROBE,
         HTTP2_LOOKAHEAD_BYTES,
@@ -113,6 +117,8 @@ module GRPC
         PER_RPC_RETRY_BUFFER_SIZE,
         PRIMARY_USER_AGENT,
         SECONDARY_USER_AGENT,
+        SERVER_MAX_PENDING_REQUESTS,
+        SERVER_HANDSHAKE_TIMEOUT_MS,
         SERVICE_CONFIG,
         SERVICE_CONFIG_DISABLE_RESOLUTION,
         SO_REUSEPORT,

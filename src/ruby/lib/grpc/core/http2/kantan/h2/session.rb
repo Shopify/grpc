@@ -440,6 +440,16 @@ module Kantan
         @write_queue << [:shutdown]
       end
 
+      # grpc: true once the reader/writer threads exist, i.e. once the
+      # connection preface has actually been read (server) or written
+      # (client). #shutdown only ever enqueues onto @write_queue, which
+      # nothing drains before that -- grpc.server_handshake_timeout_ms
+      # relies on this to know whether enqueuing a shutdown will ever be
+      # observed, or whether the socket must be closed directly instead.
+      def running?
+        !@writer.nil?
+      end
+
       # grpc: sends GOAWAY without stopping the session, unlike #shutdown, so
       # that RPCs already in flight (e.g. under max_connection_age) can keep
       # reading and writing after the peer has been told not to start any

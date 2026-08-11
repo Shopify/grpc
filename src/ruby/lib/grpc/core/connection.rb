@@ -70,6 +70,8 @@ module GRPC
       # when outlier detection is not configured). Call#op_recv_status bumps
       # it once per finished client RPC; nothing else touches it.
       attr_accessor :outlier_counter
+      # Set by Subchannel#connect_worker right after a successful dial, to
+      # whatever XdsClient::LrsCallCounter the resolved address's cluster
 
       # rubocop:disable Metrics/ParameterLists -- all but +io+ are keywords
       def initialize(io, peer:, client:, max_receive_message_length:,
@@ -83,7 +85,7 @@ module GRPC
                      min_time_between_pings: nil,
                      max_ping_strikes: DEFAULT_MAX_PING_STRIKES,
                      bdp_probe: true, lookahead_bytes: nil, max_frame_size: nil,
-                     write_buffer_size: nil,
+                     write_buffer_size: nil, handshake_timeout: nil,
                      on_new_rpc: nil, on_close: nil)
         super()
         @io = io
@@ -108,6 +110,11 @@ module GRPC
         @last_ping_sent_at = nil
         @data_frames_sent_at_last_ping = 0
         @maintenance_thread = nil
+        # grpc.server_handshake_timeout_ms: server-side only (nil on the
+        # client, which awaits its own handshake synchronously in
+        # Channel#connect_worker); the watchdog thread that enforces it.
+        @handshake_timeout = handshake_timeout
+        @handshake_thread = nil
         # Set while a PING we sent has not been acknowledged. The reader
         # thread clears it through #on_ping.
         @ping_deadline = nil
@@ -150,9 +157,49 @@ module GRPC
           @created_at = RpcStream.now
           @idle_since = @created_at
         end
+        # #start_handshake_watchdog has to run concurrently with, not after,
+        # the branch below: for a server that call blocks reading the
+        # connection preface for as long as the peer takes to send it, which
+        # is exactly the case grpc.server_handshake_timeout_ms guards
+        # against.
+        start_handshake_watchdog unless @client
         @client ? @session.connect : @session.receive
         start_maintenance
         self
+      end
+
+      # grpc.server_handshake_timeout_ms: a peer that never drives the
+      # connection to a completed HTTP/2 handshake would otherwise hold the
+      # accepting thread and its socket forever, since the preface read
+      # above has no timeout of its own. Reuses #await_handshake -- the
+      # same wait a client performs synchronously after #connect -- instead
+      # of adding a second wait/notify path.
+      def start_handshake_watchdog
+        return unless @handshake_timeout
+        @handshake_thread = Thread.new do
+          Thread.current.name = 'conn-handshake'
+          begin
+            await_handshake(@handshake_timeout)
+          rescue Closed
+            close(StatusCodes::DEADLINE_EXCEEDED,
+                  'peer never completed the HTTP/2 handshake')
+          end
+        end
+      end
+
+      # Mirrors #stop_maintenance: the watchdog may be the very thread
+      # calling #close (on timeout), and Thread#join on the current thread
+      # raises ThreadError, so that case is skipped rather than guarded with
+      # a rescue.
+      def stop_handshake_watchdog
+        thread = @mu.synchronize do
+          t = @handshake_thread
+          @handshake_thread = nil
+          t
+        end
+        return if thread.nil? || thread == Thread.current
+        thread.join(1)
+        nil
       end
 
       # One thread services keepalive pings, server-side idle/age limits and
@@ -256,12 +303,15 @@ module GRPC
           @closed = true
           @started
         end
-        if started
+        if started && @session.running?
           # The session's write thread drains the queue and closes the socket.
           @session.shutdown
         else
-          # No session threads exist yet, so nothing would ever drain a
-          # shutdown command; drop the socket directly instead of leaking it.
+          # Either #start was never called, or it is still blocked reading
+          # the connection preface (grpc.server_handshake_timeout_ms): in
+          # both cases no writer thread exists to drain a #shutdown command,
+          # so the socket has to be closed directly or it leaks. Closing it
+          # here also unblocks that pending preface read with an IOError.
           begin
             @io.close
           rescue StandardError
@@ -269,6 +319,7 @@ module GRPC
           end
         end
         stop_maintenance
+        stop_handshake_watchdog
         fail_all(status, details)
         nil
       end
