@@ -60,6 +60,90 @@ class RetryingService
 end
 RetryingStub = RetryingService.rpc_stub_class
 
+# A server-streaming servicer that can fail a fixed number of leading calls
+# before any response is yielded, and can optionally yield one response
+# before failing on top of that - the second shape exists to prove a
+# server-streaming retry never happens once the caller has seen a message.
+class RetryingServerStreamingService
+  include GRPC::GenericService
+  rpc :a_server_streaming_rpc, EchoMsg, stream(EchoMsg)
+
+  attr_reader :calls
+
+  def initialize(fail_times: 0, yield_before_failing: false)
+    @fail_times = fail_times
+    @yield_before_failing = yield_before_failing
+    @calls = 0
+    @mu = Mutex.new
+  end
+
+  def a_server_streaming_rpc(req, _call)
+    attempt = @mu.synchronize { @calls += 1 }
+    Enumerator.new do |y|
+      if attempt <= @fail_times
+        y << req if @yield_before_failing
+        raise GRPC::BadStatus.new_status_exception(
+          GRPC::Core::StatusCodes::UNAVAILABLE, 'retry me')
+      end
+      y << req
+      y << req
+    end
+  end
+end
+RetryingServerStreamingStub = RetryingServerStreamingService.rpc_stub_class
+
+# A one-shot Enumerable: raises if #each is ever called a second time, so a
+# test can prove a client-streaming retry replays its own buffered copy of
+# the requests rather than re-consuming the caller's original enumerable.
+class OneShotRequests
+  include Enumerable
+
+  def initialize(items)
+    @items = items
+    @used = false
+  end
+
+  def each(&block)
+    raise 'requests enumerable consumed a second time' if @used
+    @used = true
+    return enum_for(:each) unless block_given?
+    @items.each(&block)
+  end
+end
+
+# A client-streaming servicer that records every batch of requests it
+# actually received, and fails a fixed number of leading calls after
+# reading the whole request stream (client-streaming has nothing to send
+# back until then, so this is the only place it can fail).
+class RetryingClientStreamingService
+  include GRPC::GenericService
+  rpc :a_client_streaming_rpc, stream(EchoMsg), EchoMsg
+
+  attr_reader :calls, :received_batches
+
+  def initialize(fail_times: 0)
+    @fail_times = fail_times
+    @calls = 0
+    @received_batches = []
+    @mu = Mutex.new
+  end
+
+  def a_client_streaming_rpc(call)
+    msgs = call.each_remote_read.map(&:msg)
+    attempt = @mu.synchronize do
+      @calls += 1
+      @received_batches << msgs
+      @calls
+    end
+    if attempt <= @fail_times
+      raise GRPC::BadStatus.new_status_exception(
+        GRPC::Core::StatusCodes::UNAVAILABLE, 'retry me')
+    end
+    EchoMsg.new(msg: msgs.join(','))
+  end
+end
+RetryingClientStreamingStub = RetryingClientStreamingService.rpc_stub_class
+
 # A servicer that sleeps past a short service-config timeout, to prove the
 # timeout was actually applied as the call's deadline.
 class TimeoutProbeService
@@ -282,6 +366,96 @@ describe 'service config' do
         response = stub.an_rpc(EchoMsg.new(msg: 'hi'))
         expect(response.msg).to eq('hi')
         expect(service.calls).to eq(2)
+      end
+    end
+  end
+
+  describe 'server-streaming retries' do
+    def streaming_service_config(max_attempts: 3)
+      {
+        'methodConfig' => [
+          {
+            'name' => [{ 'service' => 'RetryingServerStreamingService',
+                         'method' => 'a_server_streaming_rpc' }],
+            'retryPolicy' => {
+              'maxAttempts' => max_attempts,
+              'initialBackoff' => '0.01s',
+              'maxBackoff' => '0.02s',
+              'backoffMultiplier' => 1.0,
+              'retryableStatusCodes' => ['UNAVAILABLE']
+            }
+          }
+        ]
+      }.to_json
+    end
+
+    def build_streaming_retry_stub(**opts)
+      build_rpc_server(client_opts: {
+                         channel_args: { 'grpc.service_config' => streaming_service_config(**opts) }
+                       })
+    end
+
+    it 'retries a server-streaming call while nothing has been yielded yet' do
+      build_streaming_retry_stub
+      service = RetryingServerStreamingService.new(fail_times: 2)
+      run_services_on_server(@server, services: [service]) do
+        stub = build_insecure_stub(RetryingServerStreamingStub)
+        responses = stub.a_server_streaming_rpc(EchoMsg.new(msg: 'hi')).to_a
+        expect(responses.map(&:msg)).to eq(%w[hi hi])
+        expect(service.calls).to eq(3)
+      end
+    end
+
+    it 'does not retry once a response has been yielded to the caller' do
+      build_streaming_retry_stub
+      service = RetryingServerStreamingService.new(fail_times: 1, yield_before_failing: true)
+      run_services_on_server(@server, services: [service]) do
+        stub = build_insecure_stub(RetryingServerStreamingStub)
+        responses = stub.a_server_streaming_rpc(EchoMsg.new(msg: 'hi'))
+        expect(responses.next.msg).to eq('hi') # committed: the caller has now seen a message
+        expect { responses.next }.to raise_error(GRPC::Unavailable)
+        expect(service.calls).to eq(1)
+      end
+    end
+  end
+
+  describe 'client-streaming retries' do
+    def streaming_service_config(max_attempts: 3)
+      {
+        'methodConfig' => [
+          {
+            'name' => [{ 'service' => 'RetryingClientStreamingService',
+                         'method' => 'a_client_streaming_rpc' }],
+            'retryPolicy' => {
+              'maxAttempts' => max_attempts,
+              'initialBackoff' => '0.01s',
+              'maxBackoff' => '0.02s',
+              'backoffMultiplier' => 1.0,
+              'retryableStatusCodes' => ['UNAVAILABLE']
+            }
+          }
+        ]
+      }.to_json
+    end
+
+    def build_streaming_retry_stub(**opts)
+      build_rpc_server(client_opts: {
+                         channel_args: { 'grpc.service_config' => streaming_service_config(**opts) }
+                       })
+    end
+
+    it 'replays the buffered requests on a retried attempt' do
+      build_streaming_retry_stub
+      service = RetryingClientStreamingService.new(fail_times: 1)
+      run_services_on_server(@server, services: [service]) do
+        stub = build_insecure_stub(RetryingClientStreamingStub)
+        # A one-shot Enumerable: if the retry re-consumed it instead of
+        # replaying its own buffered copy, this would raise on attempt 2.
+        requests = OneShotRequests.new([EchoMsg.new(msg: 'a'), EchoMsg.new(msg: 'b')])
+        response = stub.a_client_streaming_rpc(requests)
+        expect(response.msg).to eq('a,b')
+        expect(service.calls).to eq(2)
+        expect(service.received_batches).to eq([%w[a b], %w[a b]])
       end
     end
   end

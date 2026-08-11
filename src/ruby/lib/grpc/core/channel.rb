@@ -270,6 +270,14 @@ module GRPC
         !method_config(method)&.retry_policy.nil?
       end
 
+      # Whether hedging is enabled for +method+. Shares grpc.enable_retries's
+      # override with #retries_enabled?: hedging is gRPC's other response to
+      # a failed attempt, and the one flag turns both off together.
+      def hedging_enabled?(method)
+        return @enable_retries_arg != 0 unless @enable_retries_arg.nil?
+        !method_config(method)&.hedging_policy.nil?
+      end
+
       def destroy
         subchannels = nil
         @mu.synchronize do

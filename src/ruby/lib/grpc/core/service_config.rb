@@ -31,10 +31,16 @@ module GRPC
       # never consulted: this core has no notion of a subchannel being
       # transiently unready to wait on (create_call either has a transport
       # or it doesn't), so there is nothing for it to change.
-      MethodConfig = Struct.new(:timeout, :retry_policy, :wait_for_ready)
+      MethodConfig = Struct.new(:timeout, :retry_policy, :hedging_policy, :wait_for_ready)
 
       RetryPolicy = Struct.new(:max_attempts, :initial_backoff, :max_backoff,
                                :backoff_multiplier, :retryable_status_codes)
+
+      # A method config carries at most one of retry_policy/hedging_policy:
+      # gRPC treats "both configured" as a malformed methodConfig, since
+      # they are two different responses to the same failure (one after
+      # the other vs. several in parallel) and combining them isn't defined.
+      HedgingPolicy = Struct.new(:max_attempts, :hedging_delay, :non_fatal_status_codes)
 
       # Maps the enum names service config JSON uses ("UNAVAILABLE", ...) to
       # the integers this core's status codes are compared as.
@@ -81,9 +87,14 @@ module GRPC
         unless cfg.is_a?(Hash)
           raise ArgumentError, 'grpc.service_config: methodConfig entries must be objects'
         end
-        config = MethodConfig.new(parse_duration(cfg['timeout']),
-                                  parse_retry_policy(cfg['retryPolicy']),
-                                  cfg['waitForReady'])
+        retry_policy = parse_retry_policy(cfg['retryPolicy'])
+        hedging_policy = parse_hedging_policy(cfg['hedgingPolicy'])
+        if retry_policy && hedging_policy
+          raise ArgumentError,
+                'grpc.service_config: methodConfig cannot carry both a retryPolicy and a hedgingPolicy'
+        end
+        config = MethodConfig.new(parse_duration(cfg['timeout']), retry_policy,
+                                  hedging_policy, cfg['waitForReady'])
         Array(cfg['name']).each { |name| index_name(name, config) }
       end
 
@@ -126,21 +137,38 @@ module GRPC
                         parse_duration(require_field(policy, 'initialBackoff')),
                         parse_duration(require_field(policy, 'maxBackoff')),
                         Float(require_field(policy, 'backoffMultiplier')),
-                        retryable_codes(policy['retryableStatusCodes']))
+                        status_codes(policy['retryableStatusCodes']))
       rescue TypeError, ArgumentError => e
         raise ArgumentError, "grpc.service_config has a malformed retryPolicy: #{e.message}"
       end
 
+      # hedgingDelay has no per-attempt backoff: every hedge fires that
+      # many seconds after the last, on a fixed schedule that does not
+      # depend on how (or whether) earlier attempts have failed.
+      def parse_hedging_policy(policy)
+        return nil if policy.nil?
+        unless policy.is_a?(Hash)
+          raise ArgumentError, 'grpc.service_config: hedgingPolicy must be an object'
+        end
+        HedgingPolicy.new(Integer(require_field(policy, 'maxAttempts')),
+                          parse_duration(require_field(policy, 'hedgingDelay')),
+                          status_codes(policy['nonFatalStatusCodes']))
+      rescue TypeError, ArgumentError => e
+        raise ArgumentError, "grpc.service_config has a malformed hedgingPolicy: #{e.message}"
+      end
+
       def require_field(policy, field)
         value = policy[field]
-        raise ArgumentError, "retryPolicy is missing #{field}" if value.nil?
+        raise ArgumentError, "missing #{field}" if value.nil?
         value
       end
 
-      def retryable_codes(names)
+      # Shared by retryableStatusCodes and nonFatalStatusCodes: both are
+      # JSON arrays of status-code names.
+      def status_codes(names)
         Array(names).map do |name|
           STATUS_CODES_BY_NAME.fetch(name) do
-            raise ArgumentError, "retryableStatusCodes has an unknown code #{name.inspect}"
+            raise ArgumentError, "has an unknown status code #{name.inspect}"
           end
         end
       end

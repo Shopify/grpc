@@ -211,7 +211,7 @@ Layout/SpaceInsideHashLiteralBraces:
   Exclude:
     - 'qps/server.rb'
 
-# Offense count: 6
+# Offense count: 5
 # This cop supports safe autocorrection (--autocorrect).
 Layout/SpaceInsidePercentLiteralDelimiters:
   Exclude:

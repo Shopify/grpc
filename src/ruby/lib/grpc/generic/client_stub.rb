@@ -176,11 +176,14 @@ module GRPC
 
       handle_return_op(c, return_op, metadata, credentials, method) do
         execute_with_interceptors(:request_response, intercept_args, credentials, method, c) do |resolved_md|
-          retry_policy = @ch.retries_enabled?(method) && retry_policy_for(method)
-          if retry_policy
+          if @ch.retries_enabled?(method) && (retry_policy = retry_policy_for(method))
             request_response_with_retries(method, req, marshal, unmarshal, c,
                                           resolved_md, retry_policy,
                                           parent: parent, credentials: credentials)
+          elsif @ch.hedging_enabled?(method) && (hedging_policy = hedging_policy_for(method))
+            request_response_hedged(method, req, marshal, unmarshal, c,
+                                    resolved_md, hedging_policy,
+                                    parent: parent, credentials: credentials)
           else
             c.request_response(req, metadata: resolved_md)
           end
@@ -249,7 +252,13 @@ module GRPC
 
       handle_return_op(c, return_op, metadata, credentials, method) do
         execute_with_interceptors(:client_streamer, intercept_args, credentials, method, c) do |resolved_md|
-          c.client_streamer(requests, metadata: resolved_md)
+          if @ch.retries_enabled?(method) && (retry_policy = retry_policy_for(method))
+            client_streamer_with_retries(method, requests, marshal, unmarshal, c,
+                                         resolved_md, retry_policy,
+                                         parent: parent, credentials: credentials)
+          else
+            c.client_streamer(requests, metadata: resolved_md)
+          end
         end
       end
     end
@@ -330,10 +339,27 @@ module GRPC
 
       handle_return_op(c, return_op, metadata, credentials, method) do
         execute_with_interceptors(:server_streamer, intercept_args, credentials, method, c) do |resolved_md|
-          c.server_streamer(req, metadata: resolved_md, &blk)
+          if @ch.retries_enabled?(method) && (retry_policy = retry_policy_for(method))
+            server_streamer_with_retries(method, req, marshal, unmarshal, c,
+                                         resolved_md, retry_policy,
+                                         parent: parent, credentials: credentials, &blk)
+          else
+            c.server_streamer(req, metadata: resolved_md, &blk)
+          end
         end
       end
     end
+
+    # No retryPolicy/hedgingPolicy support: unlike client_streamer, bidi's
+    # requests and responses interleave on independent threads (BidiCall
+    # runs the write side in the background), so there is no point at which
+    # "everything sent so far" is both fully known and safe to replay -
+    # the caller's request enumerable routinely reacts to responses it has
+    # already consumed, and a retry can't distinguish "unlucky attempt" from
+    # "the caller already made a decision based on a response we're about
+    # to pretend never happened". A method config's retry/hedging policy is
+    # simply not consulted here; every bidi_streamer call is a single
+    # attempt, as it was before this feature existed.
 
     # bidi_streamer sends a stream of requests to the GRPC server, and yields
     # a stream of responses.
@@ -513,6 +539,86 @@ module GRPC
       end
     end
 
+    # Drives the retry loop for a server-streaming call. The request is
+    # sent (and, on a retry, re-sent to a fresh call) the moment this is
+    # called, exactly as the non-retrying path does; only *reading* the
+    # response stream is lazy. Commit happens the instant a response
+    # message reaches the caller (the `y << resp` below, whether the
+    # caller is pulling one at a time via #next or slurping the whole
+    # Enumerator): once that has happened, a later BadStatus from the same
+    # attempt is the caller's problem to see, not a reason to retry, since
+    # the caller may already have acted on data it can't unsee.
+    def server_streamer_with_retries(method, req, marshal, unmarshal, first_call,
+                                     metadata, retry_policy, parent:, credentials:, &blk)
+      deadline = first_call.deadline
+      attempt = 1
+      committed = false
+      responses = first_call.server_streamer(req, metadata: attempt_metadata(metadata, attempt))
+      enumerator = Enumerator.new do |y|
+        responses.each do |resp|
+          committed = true
+          y << resp
+        end
+      rescue GRPC::BadStatus => e
+        raise e if committed
+        backoff = attempt < retry_policy.max_attempts ? retry_backoff(e, retry_policy, attempt, deadline) : nil
+        raise e if backoff.nil?
+        sleep(backoff)
+        attempt += 1
+        call = new_active_call(method, marshal, unmarshal,
+                               deadline: deadline, parent: parent, credentials: credentials)
+        responses = call.server_streamer(req, metadata: attempt_metadata(metadata, attempt))
+        retry
+      end
+      return enumerator unless blk
+      enumerator.each(&blk)
+    end
+
+    # Drives the retry loop for a client-streaming call. Unlike a unary
+    # call, retrying here means replaying every request the caller already
+    # sent, so the requests are buffered as they are forwarded; once a
+    # BadStatus surfaces, ActiveCall#client_streamer's own atomicity (it
+    # never hands back a message before checking the status - see
+    # request_response_with_retries above) makes this uncommitted by
+    # construction, exactly like the unary case.
+    #
+    # There is one gap: if sending itself fails partway through (a
+    # Core::CallError, surfaced by ActiveCall#client_streamer as whatever
+    # receive_and_check_status finds), +buffered+ only holds a prefix of
+    # the caller's requests, and replaying a prefix would silently drop
+    # the rest. +done_buffering+ tracks whether the *original* enumerable
+    # was walked to completion at least once; only then is +buffered+
+    # trustworthy enough to replay on a further attempt.
+    def client_streamer_with_retries(method, requests, marshal, unmarshal, first_call,
+                                     metadata, retry_policy, parent:, credentials:)
+      deadline = first_call.deadline
+      buffered = []
+      done_buffering = false
+      tracked = Enumerator.new do |y|
+        requests.each do |r|
+          buffered << r
+          y << r
+        end
+        done_buffering = true
+      end
+      call = first_call
+      attempt = 1
+      stream = tracked
+      begin
+        call.client_streamer(stream, metadata: attempt_metadata(metadata, attempt))
+      rescue GRPC::BadStatus => e
+        raise e if attempt == 1 && !done_buffering
+        backoff = attempt < retry_policy.max_attempts ? retry_backoff(e, retry_policy, attempt, deadline) : nil
+        raise e if backoff.nil?
+        sleep(backoff)
+        attempt += 1
+        call = new_active_call(method, marshal, unmarshal,
+                               deadline: deadline, parent: parent, credentials: credentials)
+        stream = buffered
+        retry
+      end
+    end
+
     # Adds grpc-previous-rpc-attempts from the second attempt on, as
     # https://github.com/grpc/proposal/blob/master/A6-client-retries.md
     # requires so the server can tell attempts apart.
@@ -554,6 +660,125 @@ module GRPC
       Integer(value)
     rescue ArgumentError, TypeError
       nil
+    end
+
+    # Returns the hedging policy that applies to +method+, or nil. A
+    # method config never carries both (ServiceConfig rejects that at
+    # parse time), so this and #retry_policy_for are mutually exclusive.
+    def hedging_policy_for(method)
+      @ch.method_config(method)&.hedging_policy
+    end
+
+    # Runs the parallel-attempt loop for a hedged unary call. Unlike a
+    # retry, nothing here waits for a failure before starting the next
+    # attempt: a new one launches every hedging_delay, up to max_attempts,
+    # regardless of how the earlier ones are doing. The first attempt to
+    # finish with anything other than a nonFatalStatusCodes status decides
+    # the call - a plain success, or a status the policy doesn't excuse.
+    # A nonFatalStatusCodes failure is dropped and never seen by the
+    # caller; if nothing else is in flight when one arrives, the next
+    # hedge (if any remain) fires immediately rather than waiting out the
+    # rest of its slot, so a quick run of non-fatal failures can't stall
+    # the call for no reason.
+    #
+    # +calls+ and +threads+ are cleaned up in the ensure no matter which
+    # branch returns or raises: every ActiveCall gets cancelled (a no-op
+    # for the one that already finished normally, since ActiveCall closes
+    # its Core::Call on completion, and #cancel is documented safe after
+    # #close) and every Thread this method started is joined, so a hedge
+    # never leaves an attempt running past this call or a thread behind.
+    def request_response_hedged(method, req, marshal, unmarshal, first_call,
+                                metadata, hedging_policy, parent:, credentials:)
+      deadline = first_call.deadline
+      started_at = Core::RpcStream.now
+      outcomes = Queue.new
+      calls = { 1 => first_call }
+      threads = { 1 => spawn_hedge_attempt(first_call, req, metadata, 1, outcomes) }
+      dispatched = 1
+      outstanding = 1
+
+      begin
+        loop do
+          entry = outcomes.pop(timeout: hedge_wait_seconds(hedging_policy, dispatched, started_at, deadline))
+          if entry.nil?
+            dispatched += 1
+            outstanding += 1
+            calls[dispatched], threads[dispatched] =
+              launch_hedge_attempt(method, req, marshal, unmarshal, metadata, dispatched,
+                                   outcomes, deadline: deadline, parent: parent,
+                                             credentials: credentials)
+            next
+          end
+
+          _attempt, outcome, payload = entry
+          outstanding -= 1
+
+          unless hedge_non_fatal?(outcome, payload, hedging_policy)
+            return payload if outcome == :value
+            raise payload
+          end
+
+          # A non-fatal failure decides nothing on its own. Wait for the
+          # attempts still running; only when none are left is it worth
+          # hedging again, and if there is nothing left to hedge with this
+          # failure is the call's answer.
+          next unless outstanding.zero?
+          raise payload unless dispatched < hedging_policy.max_attempts
+          dispatched += 1
+          outstanding += 1
+          calls[dispatched], threads[dispatched] =
+            launch_hedge_attempt(method, req, marshal, unmarshal, metadata, dispatched,
+                                 outcomes, deadline: deadline, parent: parent,
+                                           credentials: credentials)
+        end
+      ensure
+        calls.each_value(&:cancel)
+        threads.each_value(&:join)
+      end
+    end
+
+    def hedge_non_fatal?(outcome, payload, hedging_policy)
+      outcome == :error && payload.is_a?(GRPC::BadStatus) &&
+        hedging_policy.non_fatal_status_codes.include?(payload.code)
+    end
+
+    def launch_hedge_attempt(method, req, marshal, unmarshal, metadata, attempt,
+                             outcomes, deadline:, parent:, credentials:)
+      call = new_active_call(method, marshal, unmarshal,
+                             deadline: deadline, parent: parent, credentials: credentials)
+      [call, spawn_hedge_attempt(call, req, metadata, attempt, outcomes)]
+    end
+
+    # Runs one hedge attempt on its own Thread, reporting [attempt, kind,
+    # payload] on +outcomes+ instead of letting anything escape. Escaping
+    # matters here: #request_response_hedged cancels every losing attempt
+    # once it has a winner, and Thread#join re-raises whatever unwound the
+    # thread, so a cancelled attempt's Core::CallError (deliberately not a
+    # StandardError, so it isn't swallowed elsewhere) would otherwise blow
+    # up the cleanup path of a call that already succeeded.
+    def spawn_hedge_attempt(call, req, metadata, attempt, outcomes)
+      Thread.new do
+        outcomes << [attempt, :value, call.request_response(req, metadata: attempt_metadata(metadata, attempt))]
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        outcomes << [attempt, :error, e]
+      end
+    end
+
+    # Seconds until hedge number (dispatched + 1) is due to fire, or nil
+    # once max_attempts have already been dispatched or the deadline has
+    # already passed. Deliberately NOT capped to the remaining deadline:
+    # doing that would make every timed-out pop look like "time to hedge",
+    # even when it was really "time to give up", and firing one more
+    # attempt on a call about to die anyway would just leak a doomed
+    # thread. Once nil, the pop below blocks for whichever outstanding
+    # attempt resolves next - each already carries the same absolute
+    # deadline into its own Core::Call, so that is bounded regardless.
+    def hedge_wait_seconds(hedging_policy, dispatched, started_at, deadline)
+      return nil if dispatched >= hedging_policy.max_attempts
+      remaining = Core::TimeSpec.from(deadline).to_relative_seconds
+      return nil if remaining && remaining <= 0
+      fire_in = (started_at + (dispatched * hedging_policy.hedging_delay)) - Core::RpcStream.now
+      fire_in.negative? ? 0 : fire_in
     end
 
     # Runs the interceptor chain and resolves metadata/credentials exactly once
