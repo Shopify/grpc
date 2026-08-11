@@ -28,6 +28,47 @@ module GRPC
     # Default timeout is infinity.
     DEFAULT_TIMEOUT = INFINITE_FUTURE
 
+    # Bounds and tracks what a client-streaming retry has buffered for
+    # replay, per grpc.per_rpc_retry_buffer_size. A long-running
+    # client-streaming call under a retry policy would otherwise hold every
+    # request it ever sent for as long as the call lives; once the buffered
+    # bytes cross the limit, #add commits the RPC - buffering stops, and
+    # whatever was held is dropped immediately rather than trailing along
+    # to the end of the call.
+    #
+    # @api private
+    class RetryReplayBuffer
+      def initialize(limit)
+        @limit = limit
+        @items = []
+        @bytes = 0
+        @committed = false
+      end
+
+      attr_reader :items, :bytes
+
+      def committed?
+        @committed
+      end
+
+      # Buffers +item+, weighing +bytesize+ against the limit, unless
+      # already committed.
+      def add(item, bytesize)
+        return if @committed
+        @bytes += bytesize
+        @bytes > @limit ? release! : (@items << item)
+      end
+
+      # Drops everything held. Once committed there is no going back: a
+      # further #add is a no-op, so a retry can never replay a partial
+      # buffer.
+      def release!
+        @items = []
+        @bytes = 0
+        @committed = true
+      end
+    end
+
     # setup_channel is used by #initialize to constuct a channel from its
     # arguments.
     def self.setup_channel(alt_chan, host, creds, channel_args = {})
@@ -110,7 +151,6 @@ module GRPC
         @call_creds    = nil
         @channel_creds = creds
       end
-
       @owns_channel = channel_override.nil?
       @ch = ClientStub.setup_channel(channel_override, host, @channel_creds,
                                      channel_args.dup)
@@ -119,47 +159,6 @@ module GRPC
       @propagate_mask = propagate_mask
       @timeout = timeout.nil? ? DEFAULT_TIMEOUT : timeout
       @interceptors = InterceptorRegistry.new(interceptors)
-    end
-
-    # Bounds and tracks what a client-streaming retry has buffered for
-    # replay, per grpc.per_rpc_retry_buffer_size. A long-running
-    # client-streaming call under a retry policy would otherwise hold every
-    # request it ever sent for as long as the call lives; once the buffered
-    # bytes cross the limit, #add commits the RPC - buffering stops, and
-    # whatever was held is dropped immediately rather than trailing along
-    # to the end of the call.
-    #
-    # @api private
-    class RetryReplayBuffer
-      def initialize(limit)
-        @limit = limit
-        @items = []
-        @bytes = 0
-        @committed = false
-      end
-
-      attr_reader :items, :bytes
-
-      def committed?
-        @committed
-      end
-
-      # Buffers +item+, weighing +bytesize+ against the limit, unless
-      # already committed.
-      def add(item, bytesize)
-        return if @committed
-        @bytes += bytesize
-        @bytes > @limit ? release! : (@items << item)
-      end
-
-      # Drops everything held. Once committed there is no going back: a
-      # further #add is a no-op, so a retry can never replay a partial
-      # buffer.
-      def release!
-        @items = []
-        @bytes = 0
-        @committed = true
-      end
     end
 
     # Closes the channel this stub opened for itself. A stub built with
@@ -638,11 +637,19 @@ module GRPC
     #
     # There is one gap: if sending itself fails partway through (a
     # Core::CallError, surfaced by ActiveCall#client_streamer as whatever
-    # receive_and_check_status finds), +buffered+ only holds a prefix of
+    # receive_and_check_status finds), the buffer only holds a prefix of
     # the caller's requests, and replaying a prefix would silently drop
     # the rest. +done_buffering+ tracks whether the *original* enumerable
-    # was walked to completion at least once; only then is +buffered+
+    # was walked to completion at least once; only then is the buffer
     # trustworthy enough to replay on a further attempt.
+    #
+    # grpc.per_rpc_retry_buffer_size (RetryReplayBuffer above) bounds how
+    # much of the stream this holds onto for replay: a long-running
+    # client-streaming call under a retry policy would otherwise buffer
+    # every request it ever sent, for as long as the call lives. Once the
+    # buffer commits, no further attempt is made, exactly as gRPC's own
+    # retry buffer behaves once it is exhausted (it does not fail the call
+    # over this).
     def client_streamer_with_retries(method, requests, marshal, unmarshal, first_call,
                                      metadata, retry_policy, parent:, credentials:)
       deadline = first_call.deadline
