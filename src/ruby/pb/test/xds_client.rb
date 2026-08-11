@@ -94,6 +94,19 @@ def create_stub(opts)
   Grpc::Testing::TestService::Stub.new(
     address,
     :this_channel_is_insecure,
+    # This client exists to be pointed at an xDS control plane, whose CDS
+    # response's lb_policy (defaulting to ROUND_ROBIN) is what a
+    # spec-conformant xDS implementation would use to pick the child LB
+    # policy for the resolved cluster. This Ruby channel does not do that
+    # wiring -- grpc.lb_policy_name is read once from channel args before
+    # any xDS resolution happens and never revisited (see
+    # GRPC::Core::Channel#build_subchannels_locked and the "no separate
+    # loadBalancingConfig selection mechanism" note in service_config.rb)
+    # -- so left at its own default of pick_first, every RPC would stick to
+    # whichever single backend EDS listed first. Setting it explicitly is
+    # what makes ping_pong and round_robin (every/each backend gets
+    # traffic) possible at all against this implementation.
+    channel_args: { 'grpc.lb_policy_name' => 'round_robin' },
   )
 end
 
