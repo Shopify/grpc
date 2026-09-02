@@ -210,37 +210,41 @@ TEST(DnsForkTest, LookupFailsSoftlyWhenChannelIsNull) {
   {
     grpc_core::Notification done;
     absl::Status status;
-    (*ares_resolver)->LookupHostname(
-        [&](const absl::StatusOr<std::vector<EventEngine::ResolvedAddress>>& r) {
-          status = r.status();
-          done.Notify();
-        },
-        "foo.test.google.fr:443", "443");
+    (*ares_resolver)
+        ->LookupHostname(
+            [&](const absl::StatusOr<std::vector<EventEngine::ResolvedAddress>>&
+                    r) {
+              status = r.status();
+              done.Notify();
+            },
+            "foo.test.google.fr:443", "443");
     done.WaitForNotification();
     EXPECT_TRUE(absl::IsUnavailable(status)) << status;
   }
   {
     grpc_core::Notification done;
     absl::Status status;
-    (*ares_resolver)->LookupSRV(
-        [&](const absl::StatusOr<
-            std::vector<EventEngine::DNSResolver::SRVRecord>>& r) {
-          status = r.status();
-          done.Notify();
-        },
-        "foo.test.google.fr:443");
+    (*ares_resolver)
+        ->LookupSRV(
+            [&](const absl::StatusOr<
+                std::vector<EventEngine::DNSResolver::SRVRecord>>& r) {
+              status = r.status();
+              done.Notify();
+            },
+            "foo.test.google.fr:443");
     done.WaitForNotification();
     EXPECT_TRUE(absl::IsUnavailable(status)) << status;
   }
   {
     grpc_core::Notification done;
     absl::Status status;
-    (*ares_resolver)->LookupTXT(
-        [&](const absl::StatusOr<std::vector<std::string>>& r) {
-          status = r.status();
-          done.Notify();
-        },
-        "foo.test.google.fr:443");
+    (*ares_resolver)
+        ->LookupTXT(
+            [&](const absl::StatusOr<std::vector<std::string>>& r) {
+              status = r.status();
+              done.Notify();
+            },
+            "foo.test.google.fr:443");
     done.WaitForNotification();
     EXPECT_TRUE(absl::IsUnavailable(status)) << status;
   }
