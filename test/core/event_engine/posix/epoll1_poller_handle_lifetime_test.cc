@@ -183,10 +183,10 @@ TEST(Epoll1PollerHandleLifetimeTest, WorkSkipsStaleEventsAfterClose) {
       /*track_err=*/false);
 
   // Register read closures so SetReady() has something to schedule.
-  handle_a->NotifyOnRead(PosixEngineClosure::TestOnlyToClosure(
-      [](absl::Status /*status*/) {}));
-  handle_b->NotifyOnRead(PosixEngineClosure::TestOnlyToClosure(
-      [](absl::Status /*status*/) {}));
+  handle_a->NotifyOnRead(
+      PosixEngineClosure::TestOnlyToClosure([](absl::Status /*status*/) {}));
+  handle_b->NotifyOnRead(
+      PosixEngineClosure::TestOnlyToClosure([](absl::Status /*status*/) {}));
 
   // Make both readable so epoll_wait() returns both in one call.
   const char byte = 'x';
