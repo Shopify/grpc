@@ -478,6 +478,32 @@ grpc_cc_test(
     ],
 )
 
+grpc_cc_test(
+    name = "epoll1_poller_handle_lifetime_test",
+    srcs = ["epoll1_poller_handle_lifetime_test.cc"],
+    external_deps = [
+        "absl/status",
+        "absl/time",
+        "gtest",
+    ],
+    tags = [
+        "no_windows",
+    ],
+    uses_event_engine = True,
+    uses_polling = True,
+    deps = [
+        ":posix_engine_test_utils",
+        "//:gpr",
+        "//:grpc",
+        "//src/core:iomgr_port",
+        "//src/core:notification",
+        "//src/core:posix_event_engine_closure",
+        "//src/core:posix_event_engine_event_poller",
+        "//src/core:posix_event_engine_poller_posix_epoll1",
+        "//test/core/test_util:grpc_test_util",
+    ],
+)
+
 grpc_cc_library(
     name = "dns_server",
     testonly = True,
@@ -506,6 +532,32 @@ grpc_cc_library(
 )
 
 grpc_cc_test(
+    name = "ares_resolver_fork_safety_test",
+    srcs = ["ares_resolver_fork_safety_test.cc"],
+    external_deps = [
+        "gtest",
+        "absl/functional:any_invocable",
+        "absl/status",
+        "absl/status:statusor",
+    ],
+    tags = [
+        "no_windows",
+    ],
+    uses_event_engine = True,
+    uses_polling = True,
+    deps = [
+        ":dns_server",
+        "//:event_engine_base_hdrs",
+        "//:gpr_platform",
+        "//:grpc",
+        "//src/core:ares_resolver",
+        "//src/core:notification",
+        "//src/core:posix_event_engine",
+        "//test/core/test_util:grpc_test_util",
+    ],
+)
+
+grpc_cc_test(
     name = "dns_fork_test",
     srcs = ["dns_fork_test.cc"],
     external_deps = [
@@ -524,6 +576,7 @@ grpc_cc_test(
         "//:gpr_platform",
         "//:grpc",
         "//src/core:event_engine_tcp_socket_utils",
+        "//src/core:ares_resolver",
         "//src/core:notification",
         "//src/core:posix_event_engine",
         "//test/core/test_util:grpc_test_util",
