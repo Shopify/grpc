@@ -38,6 +38,7 @@ require 'google/protobuf'
 require_relative '../src/proto/grpc/testing/empty_pb'
 require_relative '../src/proto/grpc/testing/messages_pb'
 require_relative '../src/proto/grpc/testing/test_services_pb'
+require 'grpc/channelz/service'
 
 class RpcConfig
   attr_reader :rpcs_to_send, :metadata_to_send, :timeout_sec
@@ -54,17 +55,20 @@ $RPC_MAP = {
   'EmptyCall' => :EMPTY_CALL,
 }
 
-# Some global variables to be shared by server and client
+# Some global variables to be shared by server and client. Every RPC gets
+# the next request id when it starts; a stats watcher covers the ids
+# started after it registered and counts each one when it completes,
+# which is what "the next num_rpcs sent by client" means in
+# LoadBalancerStatsRequest.
 $watchers = Array.new
 $watchers_mutex = Mutex.new
 $watchers_cv = ConditionVariable.new
+$next_request_id = 0
 $shutdown = false
 # These can be configured by the test runner dynamically
 $rpc_config = RpcConfig.new
 $rpc_config.init([:UNARY_CALL], {})
 # These stats are shared across threads
-$thread_results = Array.new
-$thread_results_mu = Mutex.new
 $accumulated_stats_mu = Mutex.new
 $num_rpcs_started_by_method = {}
 $num_rpcs_succeeded_by_method = {}
@@ -155,6 +159,8 @@ class TestTarget < Grpc::Testing::LoadBalancerStatsService::Service
     watcher = {}
     $watchers_mutex.synchronize do
       watcher = {
+        "start" => $next_request_id,
+        "end" => $next_request_id + req['num_rpcs'],
         "rpcs_by_method" => Hash.new(),
         "rpcs_by_peer" => Hash.new(0),
         "rpcs_needed" => req['num_rpcs'],
@@ -203,7 +209,7 @@ class TestTarget < Grpc::Testing::LoadBalancerStatsService::Service
   end
 end
 
-def execute_rpc_in_thread(op, rpc)
+def execute_rpc_in_thread(op, rpc, request_id)
   Thread.new {
     rpc_stats_key = rpc.to_s
     remote_peer = ""
@@ -222,10 +228,33 @@ def execute_rpc_in_thread(op, rpc)
         $accumulated_method_stats[rpc_stats_key].add_result(e.code)
       end
     end
-    $thread_results_mu.synchronize do
-      $thread_results << [rpc, remote_peer]
-    end
+    record_rpc_result(request_id, rpc, remote_peer)
   }
+end
+
+# Counts one completed RPC against every watcher whose id range covers
+# it. A failure is an RPC that completed without a remote peer; an RPC
+# still outstanding when the watcher times out stays in rpcs_needed.
+def record_rpc_result(request_id, rpc, remote_peer)
+  # These stats expect rpc_name to be in the form of UnaryCall or
+  # EmptyCall, not the underscore-case all-caps form
+  rpc_name = $RPC_MAP.invert()[rpc]
+  $watchers_mutex.synchronize do
+    $watchers.each do |watcher|
+      next unless watcher['start'] <= request_id && request_id < watcher['end']
+      watcher['rpcs_needed'] -= 1
+      if remote_peer.strip.empty?
+        watcher['no_remote_peer'] += 1
+      else
+        watcher['rpcs_by_method'][rpc_name] ||= Hash.new(0)
+        # increment the remote hostname distribution histogram
+        # both by overall, and broken down per RPC
+        watcher['rpcs_by_method'][rpc_name][remote_peer] += 1
+        watcher['rpcs_by_peer'][remote_peer] += 1
+      end
+    end
+    $watchers_cv.broadcast
+  end
 end
 
 # send 1 rpc every 1/qps second
@@ -249,7 +278,6 @@ def run_test_loop(stub, target_seconds_between_rpcs, fail_on_failed_rpcs)
     end
     deadline_sec = $rpc_config.timeout_sec > 0 ? $rpc_config.timeout_sec : 30
     deadline = GRPC::Core::TimeConsts::from_relative_time(deadline_sec)
-    results = {}
     $rpc_config.rpcs_to_send.each do |rpc|
       # rpc is in the form of :UNARY_CALL or :EMPTY_CALL here
       metadata = $rpc_config.metadata_to_send.key?(rpc) ?
@@ -271,39 +299,12 @@ def run_test_loop(stub, target_seconds_between_rpcs, fail_on_failed_rpcs)
       else
         raise "Unsupported rpc #{rpc}"
       end
-      keep_open_threads << execute_rpc_in_thread(op, rpc)
-    end
-    # collect results from threads
-    $thread_results_mu.synchronize do
-      $thread_results.each do |r|
-        rpc_name, remote_peer = r
-        results[rpc_name] = remote_peer
+      request_id = $watchers_mutex.synchronize do
+        id = $next_request_id
+        $next_request_id += 1
+        id
       end
-      $thread_results = Array.new
-    end
-    $watchers_mutex.synchronize do
-      $watchers.each do |watcher|
-        # this is counted once when each group of all rpcs_to_send were done
-        watcher['rpcs_needed'] -= 1
-        results.each do |rpc_name, remote_peer|
-          # These stats expect rpc_name to be in the form of
-          # UnaryCall or EmptyCall, not the underscore-case all-caps form
-          rpc_name = $RPC_MAP.invert()[rpc_name]
-          if remote_peer.strip.empty?
-            # error is counted per individual RPC
-            watcher['no_remote_peer'] += 1
-          else
-            if not watcher['rpcs_by_method'].key?(rpc_name)
-              watcher['rpcs_by_method'][rpc_name] = Hash.new(0)
-            end
-            # increment the remote hostname distribution histogram
-            # both by overall, and broken down per RPC
-            watcher['rpcs_by_method'][rpc_name][remote_peer] +=  1
-            watcher['rpcs_by_peer'][remote_peer] += 1
-          end
-        end
-      end
-      $watchers_cv.broadcast
+      keep_open_threads << execute_rpc_in_thread(op, rpc, request_id)
     end
   end
   keep_open_threads.each { |thd| thd.join }
@@ -321,6 +322,15 @@ def parse_args
   args['num_channels'] = 1
   args['rpc'] = 'UnaryCall'
   args['metadata'] = ''
+  # The psm-interop test runner (see framework/helpers/docker.py) only ever
+  # passes --server and --stats_port; every other flag, --qps included,
+  # must have a default that keeps run_test_loop's rate computation
+  # (1.0 / qps) finite -- an unset qps reads back as nil, and
+  # nil.to_f.zero? makes that division Infinity, which turns the very
+  # first `sleep_seconds < 0` branch's `target_next_start = now +
+  # target_seconds_between_rpcs` into a `sleep(Infinity)` on the next
+  # loop iteration, after which no further RPC is ever sent.
+  args['qps'] = 1
   OptionParser.new do |opts|
     opts.on('--fail_on_failed_rpcs BOOL', ['false', 'true']) do |v|
       args['fail_on_failed_rpcs'] = v == 'true'
@@ -359,6 +369,7 @@ def main
   s.add_http2_port(host, :this_port_is_insecure)
   s.handle(TestTarget)
   s.handle(ConfigureTarget)
+  s.handle(Grpc::Channelz::Service.new)
   server_thread = Thread.new {
     # run the server until the main test runner terminates this process
     s.run_till_terminated_or_interrupted(['TERM'])
