@@ -17,6 +17,7 @@
 require_relative '../version'
 require_relative 'call'
 require_relative 'channel_args'
+require_relative 'channelz'
 require_relative 'connection'
 require_relative 'constants'
 require_relative 'credentials'
@@ -60,7 +61,7 @@ module GRPC
 
       attr_reader :target, :call_credentials, :default_compression_algorithm,
                   :max_metadata_size, :absolute_max_metadata_size,
-                  :per_rpc_retry_buffer_size
+                  :per_rpc_retry_buffer_size, :channelz_id
 
       def initialize(target, channel_args, credentials)
         @target = target
@@ -100,6 +101,7 @@ module GRPC
         @last_error = nil
         @destroyed = false
         LIVE[self] = true
+        @channelz_id = Channelz.register_channel(self)
       end
 
       # Every setting this channel takes from its arguments. Kept apart from
@@ -275,12 +277,25 @@ module GRPC
           @state = ConnectivityStates::FATAL_FAILURE
           @cv.broadcast
         end
+        Channelz.unregister_channel(@channelz_id)
         stop_outlier_detection_timer(outlier_timer)
         watch&.cancel
         subchannels&.each(&:close)
         nil
       end
       alias close destroy
+
+      # #connectivity_state without the "closed!" guard, for the channelz
+      # service: it needs the terminal state precisely because #destroy
+      # already makes the normal accessor raise, and a channel torn down
+      # in one thread while another thread is mid-listing must still
+      # report a real (SHUTDOWN-mapped, since @state is FATAL_FAILURE by
+      # then) state rather than blow up the listing.
+      #
+      # @api private
+      def channelz_state
+        @mu.synchronize { @state }
+      end
 
       # Opens a stream for a new RPC, connecting first if necessary.
       #
