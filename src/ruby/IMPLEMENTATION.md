@@ -112,19 +112,33 @@ place of about 6800 lines of C.
   aggregate state, because a single-address channel going READY to IDLE
   aggregates to IDLE, and redialling there races the backoff path that
   owns "every address failed".
+- **Public deadlines are absolute; internal clocks are monotonic.**
+  `Channel#watch_connectivity_state` and every other API the C extension
+  had take a `Time`, a `GRPC::Core::TimeConsts` value, or epoch seconds.
+  `RpcStream.now` counts seconds from an arbitrary start such as boot, so
+  passing `RpcStream.now + n` as a deadline names a moment decades ago:
+  the call returns at once, and a loop around it spins and starves every
+  other thread. Pass `Time.now + n`.
 
 ## Verification
 
 | Suite | How to run | State |
 | --- | --- | --- |
-| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 848 examples, 6 failures |
+| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 863 examples, 6 failures |
 | End to end | run each `src/ruby/end2end/*_test.rb` | 23 of 24 |
 | gRPC interop | `src/ruby/pb/test/{server,client}.rb` | 16 of 16, insecure and TLS |
 | xDS conformance | `ruby src/ruby/pb/test/xds_conformance/run.rb` | 5 of 5 |
+| PSM Light (upstream) | `src/ruby/pb/test/psm_light/run.sh`, see below | 4 of 4 |
 | h2spec | point it at a server on the vendored session | 146 of 146, both write paths, 10 runs each |
 | Negative HTTP/2 | `test/http2_test/http2_test_server.py`, see below | 8 of 8 |
 | hpack-test-case | kantan's `test/test_hpack.rb` | 41 runs, 0 failures |
-| RuboCop | `rake rubocop` | clean |
+| RuboCop | `rake rubocop` | clean with RuboCop 1.86.2 |
+
+Every result above was taken on Ruby 4.0.2, except PSM Light, whose Ruby
+client runs on the `ruby:4.0-slim` image (4.0.7 on aarch64-linux at the
+time). The gemspec's `~> 1.82.0` RuboCop (1.82.0 and 1.82.1 alike)
+reports offenses that 1.86.2 does not, in files that were clean at the
+time; use 1.86.2 when comparing against this table.
 
 The six RSpec failures and the one end to end failure all shell out to
 `cmake/build/grpc_ruby_plugin` and `cmake/build/third_party/protobuf/protoc`.
@@ -158,6 +172,33 @@ and dead on modern Python; run a patched copy outside the tree rather
 than modifying it, pinning `h2==3.2.0` and `protobuf==3.20.3`, and fixing
 `dict.has_key`, the `client_side` keyword that moved into
 `H2Configuration`, and a str buffer that must be bytes.
+
+`src/ruby/pb/test/psm_light/` runs upstream's own xDS conformance suites,
+unmodified: PSM Light, grpc/psm-interop's `tests/fallback_test.py` (gRFC
+A71: three cases) and `tests/federation_test.py` (gRFC A47: one case).
+They need no GKE, but upstream publishes their images only to a registry
+that needs grpc-testing credentials, so `build_images.sh <psm-interop
+checkout>` builds all four locally: psm-interop's Go control plane, this
+repository's Python xDS interop server and client on released grpcio
+wheels, and the Ruby client. Then
+`PSM_INTEROP_DIR=<checkout> run.sh psm-local/ruby-client:latest
+fallback_test`. The Python server stands in for upstream's canonical Java
+one. Run the Python client first: it is the positive control, and it
+passes 4 of 4 here too, so a Ruby failure is Ruby's. Two harness details
+matter on a laptop. Logs, and the bootstrap every container mounts, live
+under `$HOME`, because a VM-backed Docker may not share `/tmp`. When the
+host's own name resolves to loopback, which the suites would put into
+every EDS endpoint, `run.sh` substitutes the address containers use for
+the host.
+
+Getting these suites to pass found four defects that no spec had caught:
+the test app counted an RPC when it was sent rather than when it
+completed, so a client whose RPCs all failed late reported no failures;
+the test app had no `--qps` default and slept forever after its first
+RPC; a channel whose first resolve failed crashed its backoff timer and
+stayed in TRANSIENT_FAILURE; and the xDS status thread spun, which
+starved every other thread and made `xds_lrs_spec.rb` fail in a way that
+looked like machine load.
 
 ## Performance
 
@@ -564,11 +605,26 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   independent threads, so there is no point at which everything sent so
   far is both known and safe to replay. Hedging is unary only.
 - The xDS client follows LDS, RDS, CDS and EDS over ADS, reports load
-  back over LRS, resolves authority-qualified `xds://authority/name`
-  targets against the bootstrap, and pushes endpoint changes into a live
-  channel. It does not implement SDS certificate provisioning, RBAC or
-  fault-injection filters, aggregate clusters, or weighted locality
-  routing beyond taking the heaviest cluster of a weighted set.
+  back over LRS, and pushes endpoint changes into a live channel. It
+  routes every resource by the authority in its own `xdstp://` name (gRFC
+  A47), so a listener from one authority can name a cluster on another.
+  It falls back through an authority's ordered server list when a watched
+  resource is uncached and the active server fails, and it returns to a
+  higher-priority server as soon as that server answers (gRFC A71). Each
+  management server has one channel for as long as it is in use, so
+  channelz shows a server that is down as TRANSIENT_FAILURE, which the
+  PSM Light fallback suite checks. It does not implement SDS certificate
+  provisioning, RBAC or fault-injection filters, aggregate clusters, or
+  weighted locality routing beyond taking the heaviest cluster of a
+  weighted set.
+- Where the xDS client differs from C-core's: a subscription is never
+  withdrawn, so an authority and its connections live as long as the
+  process; reconnects are paced by the connection's backoff and by the
+  channel's own, not one; the keepalive resend repeats only the listener
+  subscription; a resource that names an authority the bootstrap does not
+  define stays unresolved until its caller times out, not a distinct
+  error; and a failing server whose resources are all cached produces no
+  signal beyond channelz.
 - A pushed endpoint list reaches a running channel; a DNS one does not.
   `dns:` targets still resolve once and re-resolve only after every
   address has failed, with no polling timer, which is what the C
@@ -587,8 +643,11 @@ in mind before changing `session.rb`, `rpc_stream.rb` or `hpack.rb`.
   checking drives the `Watch` RPC against a backend that offers it, and
   falls open when a backend does not, but this core's own servicer still
   has no `Watch`, which is what upstream Ruby ships. There is no server
-  reflection and no channelz; the C extension exposed neither to Ruby, so
-  they were never parity gaps.
+  reflection. Channelz answers `GetTopChannels` and `GetChannel` with each
+  channel's target and state; servers, subchannels, sockets and call
+  counters are not tracked, and every other method is UNIMPLEMENTED. The
+  C extension exposed neither to Ruby; channelz exists here because the
+  PSM Light suites read ADS channel states through it.
 - A leaked thread is a production bug here, not a test nuisance. Two were
   found by instrumenting `Thread.list` across the suite: `ClientStub` had
   no way to close a channel it opened for itself, where the C extension
