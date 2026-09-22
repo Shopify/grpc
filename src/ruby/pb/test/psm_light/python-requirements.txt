@@ -1,0 +1,13 @@
+grpcio==1.83.0
+grpcio-tools==1.83.0
+grpcio-health-checking==1.83.0
+grpcio-channelz==1.83.0
+grpcio-admin==1.83.0
+grpcio-csds==1.83.0
+grpcio-reflection==1.83.0
+grpcio-csm-observability==1.83.0
+grpcio-observability==1.83.0
+opentelemetry-exporter-prometheus
+opentelemetry-sdk
+prometheus-client
+protobuf==7.36.2
