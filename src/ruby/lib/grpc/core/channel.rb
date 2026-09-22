@@ -704,6 +704,15 @@ module GRPC
           subchannels, outlier_timer = @mu.synchronize do
             @idle_timer = nil
             next [nil, nil] if @destroyed
+            # A resolve that failed before any policy existed (the very
+            # first one, or the first after a teardown) has nothing to
+            # tear down. It still owes the same IDLE a failed policy gets,
+            # so the next call re-resolves -- unless that call already
+            # started a resolve while this timer slept.
+            if @lb_policy.nil?
+              transition_locked(ConnectivityStates::IDLE) unless @resolving
+              next [nil, nil]
+            end
             next [nil, nil] unless @lb_policy.connectivity_state == ConnectivityStates::TRANSIENT_FAILURE
             stale = @subchannels
             timer = @outlier_detection_timer

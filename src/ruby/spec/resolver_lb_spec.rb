@@ -195,6 +195,24 @@ describe 'DNS resolution to multiple addresses and load balancing' do
     end
   end
 
+  describe 'a channel whose first resolution fails' do
+    # The backoff timer that follows a failed resolve used to assume a
+    # policy existed to inspect, so a channel that had never resolved
+    # crashed that timer and sat in TRANSIENT_FAILURE for good.
+    it 'backs off to IDLE even though it has no policy to tear down' do
+      allow(GRPC::Core::Transport).to receive(:resolve_addresses).and_raise(SocketError, 'no such host')
+      ch = GRPC::Core::Channel.new('unresolvable.example:443', {}, :this_channel_is_insecure)
+      ch.connectivity_state(true)
+
+      failed = wait_until { ch.connectivity_state == GRPC::Core::ConnectivityStates::TRANSIENT_FAILURE }
+      expect(failed).to be(true)
+      idle = wait_until(5.0) { ch.connectivity_state == GRPC::Core::ConnectivityStates::IDLE }
+      expect(idle).to be(true)
+    ensure
+      ch&.close
+    end
+  end
+
   describe 'end to end through a Channel' do
     it 'pick_first falls past a dead address to a live one' do
       build_rpc_server
