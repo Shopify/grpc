@@ -116,9 +116,9 @@ describe 'xds' do
     )
   end
 
-  def route_config_resource(cluster_name: XDS_CLUSTER_NAME)
+  def route_config_resource(name: XDS_ROUTE_NAME, cluster_name: XDS_CLUSTER_NAME)
     Envoy::Config::Route::V3::RouteConfiguration.new(
-      name: XDS_ROUTE_NAME,
+      name: name,
       virtual_hosts: [
         Envoy::Config::Route::V3::VirtualHost.new(
           name: 'vh', domains: ['*'],
@@ -414,7 +414,8 @@ describe 'xds' do
   end
 
   describe 'xDS federation (gRFC A47)' do
-    it 'resolves an xds://authority/name target through that authority\'s own management server' do
+    it 'resolves an xds://authority/name target, and every resource its chain names under that ' \
+       'same authority, through that authority\'s own management server' do
       start_management_server do
         federated_authority = 'other-authority.example.com'
         federated_management, federated_uri = start_extra_management_server
@@ -425,13 +426,30 @@ describe 'xds' do
                             })
 
         resolved_listener_name = "xdstp://#{federated_authority}/envoy.config.listener.v3.Listener/fed-service"
+        # gRFC A47 routes a resource by its own name's authority, not by
+        # whatever authority discovered it: an old-style (non-xdstp) RDS/
+        # CDS/EDS name here would route to the top-level xds_servers, not
+        # to this federated authority's own server, so the whole chain
+        # stays under xdstp://<federated_authority>/... throughout.
+        fed_route_name = "xdstp://#{federated_authority}/envoy.config.route.v3.RouteConfiguration/fed-route"
+        fed_cluster_name = "xdstp://#{federated_authority}/envoy.config.cluster.v3.Cluster/fed-cluster"
         federated_management.on(
-          XDS_LDS, &ack_only_responder(XDS_LDS, listener_resource(name: resolved_listener_name),
+          XDS_LDS, &ack_only_responder(XDS_LDS, listener_resource(name: resolved_listener_name,
+                                                                  route_config_name: fed_route_name),
                                        version: 'v1', nonce: 'n-lds-1')
         )
-        federated_management.on(XDS_RDS, &ack_only_responder(XDS_RDS, route_config_resource, version: 'v1', nonce: 'n-rds-1'))
-        federated_management.on(XDS_CDS, &ack_only_responder(XDS_CDS, cluster_resource, version: 'v1', nonce: 'n-cds-1'))
-        federated_management.on(XDS_EDS, &ack_only_responder(XDS_EDS, endpoint_resource(port: 21_005), version: 'v1', nonce: 'n-eds-1'))
+        federated_management.on(
+          XDS_RDS, &ack_only_responder(XDS_RDS, route_config_resource(name: fed_route_name, cluster_name: fed_cluster_name),
+                                       version: 'v1', nonce: 'n-rds-1')
+        )
+        federated_management.on(
+          XDS_CDS, &ack_only_responder(XDS_CDS, cluster_resource(name: fed_cluster_name),
+                                       version: 'v1', nonce: 'n-cds-1')
+        )
+        federated_management.on(
+          XDS_EDS, &ack_only_responder(XDS_EDS, endpoint_resource(name: fed_cluster_name, port: 21_005),
+                                       version: 'v1', nonce: 'n-eds-1')
+        )
 
         target = GRPC::Core::Transport.parse_target("xds://#{federated_authority}/fed-service")
         addresses = GRPC::Core::Transport.resolve_addresses(target)
@@ -441,6 +459,61 @@ describe 'xds' do
         # The top-level (unfederated) management server -- the one @host
         # points at -- never saw any of this: the whole chain went to the
         # authority's own server instead.
+        expect(@management.requests).to be_empty
+      end
+    end
+
+    it 'routes a Cluster/EDS named under a different authority than the Listener that references it' do
+      start_management_server do
+        # A Listener served by authority "a" names, by full xdstp name, a
+        # Cluster served by a completely different authority "b" -- the
+        # scenario upstream's federation_test.py actually exercises.
+        authority_a = 'authority-a.example.com'
+        authority_b = 'authority-b.example.com'
+        management_a, uri_a = start_extra_management_server
+        management_b, uri_b = start_extra_management_server
+
+        configure_bootstrap(authorities: {
+                              authority_a => { 'xds_servers' => [{ 'server_uri' => uri_a, 'channel_creds' => [{ 'type' => 'insecure' }] }] },
+                              authority_b => { 'xds_servers' => [{ 'server_uri' => uri_b, 'channel_creds' => [{ 'type' => 'insecure' }] }] }
+                            })
+
+        resolved_listener_name = "xdstp://#{authority_a}/envoy.config.listener.v3.Listener/cross-service"
+        cross_route_name = "xdstp://#{authority_a}/envoy.config.route.v3.RouteConfiguration/cross-route"
+        cross_cluster_name = "xdstp://#{authority_b}/envoy.config.cluster.v3.Cluster/cross-cluster"
+
+        management_a.on(
+          XDS_LDS, &ack_only_responder(XDS_LDS, listener_resource(name: resolved_listener_name,
+                                                                  route_config_name: cross_route_name),
+                                       version: 'v1', nonce: 'n-lds-1')
+        )
+        management_a.on(
+          XDS_RDS, &ack_only_responder(XDS_RDS, route_config_resource(name: cross_route_name, cluster_name: cross_cluster_name),
+                                       version: 'v1', nonce: 'n-rds-1')
+        )
+        management_b.on(
+          XDS_CDS, &ack_only_responder(XDS_CDS, cluster_resource(name: cross_cluster_name),
+                                       version: 'v1', nonce: 'n-cds-1')
+        )
+        management_b.on(
+          XDS_EDS, &ack_only_responder(XDS_EDS, endpoint_resource(name: cross_cluster_name, port: 21_006),
+                                       version: 'v1', nonce: 'n-eds-1')
+        )
+
+        target = GRPC::Core::Transport.parse_target("xds://#{authority_a}/cross-service")
+        # Two real connections (one per authority) to establish before this
+        # resolves, rather than the one every other test needs -- a wider
+        # timeout than the client's own 10s default, not a different
+        # resolution path, so the whole target-parsing/authority-routing
+        # chain Transport.parse_target set up is still exactly what runs.
+        addresses = GRPC::Core::XdsClient.instance.resolve_endpoints(target.path, authority: target.xds_authority, timeout: 30)
+
+        expect(addresses.map { |a| [a.host, a.port] }).to eq([['127.0.0.1', 21_006]])
+        wait_until { management_b.requests.count { |r| !r.response_nonce.empty? } >= 2 }
+        # Each authority's server saw exactly its own two resource types --
+        # LDS/RDS went to "a", CDS/EDS to "b" -- and nothing crossed over.
+        expect(management_a.requests.map(&:type_url).uniq).to contain_exactly(XDS_LDS, XDS_RDS)
+        expect(management_b.requests.map(&:type_url).uniq).to contain_exactly(XDS_CDS, XDS_EDS)
         expect(@management.requests).to be_empty
       end
     end

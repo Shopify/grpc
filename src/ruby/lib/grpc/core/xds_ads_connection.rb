@@ -17,11 +17,24 @@
 module GRPC
   module Core
     class XdsClient
-      # One management server's ADS bidi stream (LDS/RDS/CDS/EDS), plus --
-      # lazily, only if some Cluster it hears about actually asks for it --
-      # that same server's LRS stream. XdsClient owns one of these per
-      # distinct server_uri (see XdsClient#connection_for); a process with
-      # only the default, unfederated bootstrap has exactly one.
+      # One management server's wire connection: a single persistent Channel
+      # (so channelz has something to report for as long as this server is in
+      # use -- see #status_ok? and #close), the ADS bidi stream (LDS/RDS/CDS/
+      # EDS) that stream runs on, and -- lazily, only if some Cluster this
+      # connection hears about actually asks for it -- that same server's LRS
+      # stream. XdsClient owns one of these per distinct server_uri (see
+      # #connection_for); a process with only the default, unfederated
+      # bootstrap and no fallback server has exactly one.
+      #
+      # This class knows nothing about listeners, route configs, clusters or
+      # the dependency chain between them -- gRFC A47 (federation) and A71
+      # (fallback) both route by an *authority*, and one management server
+      # can serve resources for several authorities (or none at all, if every
+      # authority's traffic has fallen forward past it). That routing, the
+      # per-authority ordered server list, and the resource cache all belong
+      # to XdsClient itself; this class only multiplexes (type_url, name)
+      # subscriptions onto one wire connection and reports back what came of
+      # them.
       #
       # @api private
       class AdsConnection
@@ -40,13 +53,6 @@ module GRPC
         ADS_METHOD = '/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources'
         LRS_METHOD = '/envoy.service.load_stats.v3.LoadReportingService/StreamLoadStats'
 
-        # A cluster's endpoints are unusable in these health states; see
-        # envoy/config/core/v3/health_check.proto's HealthStatus. UNKNOWN
-        # (0) and HEALTHY (1) pass, DEGRADED (5) passes too since dropping
-        # it entirely would be worse than an eds-only client without full
-        # weighted-priority support picking a degraded endpoint.
-        UNUSABLE_HEALTH_STATUSES = [2, 3, 4].freeze # UNHEALTHY, DRAINING, TIMEOUT
-
         INITIAL_BACKOFF = 1
         MAX_BACKOFF = 120
         # How long an idle connection (nothing new to subscribe/report,
@@ -57,11 +63,23 @@ module GRPC
         # change. See #keepalive_request_locked and #pump_lrs_requests.
         KEEPALIVE_INTERVAL = 3
         QUEUE_POLL_INTERVAL = 0.1
+        # How long the status-watch thread waits, at most, between checks
+        # that #close has not been asked for -- it otherwise blocks in
+        # Channel#watch_connectivity_state, which #close's Channel#destroy
+        # wakes immediately, so this bound is only for a #close race with
+        # the very first iteration.
+        STATUS_POLL_INTERVAL = 5
 
-        def initialize(server, node)
+        attr_reader :server_uri, :dedup_key
+
+        def initialize(server, node, on_resource:, on_healthy:, on_status_change:)
           @server_uri = server.server_uri
+          @dedup_key = [server.server_uri, server.channel_creds_type]
           @channel_creds = channel_creds_for(server.channel_creds_type)
           @node = node
+          @on_resource = on_resource
+          @on_healthy = on_healthy
+          @on_status_change = on_status_change
 
           @mu = Mutex.new
           @cv = ConditionVariable.new
@@ -74,19 +92,6 @@ module GRPC
           @subscribed = Hash.new { |h, k| h[k] = {} }
           @versions = Hash.new('')
           @nonces = Hash.new('')
-          # Per resource type: name => decoded message last accepted.
-          @resources = Hash.new { |h, k| h[k] = {} }
-          # Per listener name: watch id => callback (see #watch_endpoints),
-          # and the addresses last delivered to it, so a response that
-          # leaves #endpoints_for_locked unchanged does not re-notify.
-          @watchers = Hash.new { |h, k| h[k] = {} }
-          @watch_last = {}
-
-          # The chain a listener name resolves through, filled in as each
-          # link's response arrives.
-          @listener_route_config = {} # listener name => route config name
-          @route_cluster = {} # route config name => cluster name
-          @cluster_eds_name = {} # cluster name => EDS service_name
 
           # LRS: clusters this connection has seen a Cluster#lrs_server
           # pointing at "self" for, their running counters (created lazily,
@@ -103,68 +108,87 @@ module GRPC
           @lrs_request_queue = nil
           @lrs_backoff = ReconnectBackoff.new(initial: INITIAL_BACKOFF, min: INITIAL_BACKOFF, max: MAX_BACKOFF)
 
+          # One persistent Channel for the life of this connection -- see
+          # #status_ok? (gRFC A71 fallback triggers off its connectivity
+          # state) and the class comment above. Every ADS/LRS stream
+          # attempt below rides this same Channel (via
+          # ClientStub#channel_override) rather than opening a fresh one,
+          # so channelz has something to report between reconnect attempts
+          # and #close is the only thing that ever tears it down.
+          @channel = Channel.new(@server_uri, {}, @channel_creds)
+
           @request_queue = nil
           @backoff = ReconnectBackoff.new(initial: INITIAL_BACKOFF, min: INITIAL_BACKOFF, max: MAX_BACKOFF)
           @stream_thread = Thread.new do
             Thread.current.name = 'xds-ads'
             drive_stream
           end
-        end
-
-        # Subscribes (if not already) to +listener_name+ and blocks until
-        # its LDS -> RDS -> CDS -> EDS chain has resolved to a set of
-        # endpoints, or +timeout+ seconds pass.
-        #
-        # @return [Array<Transport::Target>]
-        def resolve_endpoints(listener_name, timeout:)
-          subscribe(TYPE_LISTENER, listener_name)
-          deadline = RpcStream.now + timeout
-          @mu.synchronize do
-            loop do
-              addresses = endpoints_for_locked(listener_name)
-              return addresses unless addresses.nil?
-              remaining = deadline - RpcStream.now
-              if remaining <= 0
-                fail XdsClient::Error, "xDS resolution of #{listener_name.inspect} via #{@server_uri} timed out"
-              end
-              @cv.wait(@mu, [remaining, 0.05].min)
-            end
+          @status_thread = Thread.new do
+            Thread.current.name = 'xds-status'
+            watch_status
           end
         end
 
-        # Registers +block+ to be called, from whichever thread is
-        # handling the response (see #handle_response), with a fresh
-        # Array<Transport::Target> every time a later ADS response changes
-        # +listener_name+'s resolved endpoints. Returns an id
-        # #unwatch_endpoints needs to cancel it; safe to call more than
-        # once for the same +listener_name+.
-        def watch_endpoints(listener_name, &block)
-          subscribe(TYPE_LISTENER, listener_name)
-          id = Object.new
-          @mu.synchronize { @watchers[listener_name][id] = block }
-          id
+        # Subscribes (if not already) to +name+ of +type_url+, sending the
+        # request immediately if the ADS stream is up.
+        def subscribe(type_url, name)
+          @mu.synchronize do
+            next if @subscribed[type_url].key?(name)
+            @subscribed[type_url][name] = true
+            send_request_locked(type_url)
+          end
         end
 
-        def unwatch_endpoints(listener_name, id)
-          @mu.synchronize { @watchers[listener_name].delete(id) }
-          nil
+        # Whether this connection's Channel currently looks usable -- gRFC
+        # A71's fallback trigger. A freshly created Channel is IDLE, not
+        # TRANSIENT_FAILURE, so a connection is presumed healthy until
+        # proven otherwise, exactly like a freshly added fallback server in
+        # C-core's MaybeFallbackLocked.
+        def status_ok?
+          @channel.connectivity_state(false) != ConnectivityStates::TRANSIENT_FAILURE
+        end
+
+        # Notes that +cluster+ wants load reporting from this server (its
+        # lrs_server points at "self") and, the first time any cluster on
+        # this connection does, starts the LRS stream.
+        def note_lrs(cluster)
+          return unless cluster.lrs_server&.config_source_specifier == :self
+          @mu.synchronize do
+            next if @lrs_clusters.key?(cluster.name)
+            @lrs_clusters[cluster.name] = true
+            ensure_lrs_stream_locked
+          end
+        end
+
+        # nil (LRS never requested by any cluster on this connection) or
+        # not yet requested for +cluster_name+ specifically: no counter, so
+        # the resolved Target carries none and Subchannel/Connection never
+        # wire up anything for it.
+        def lrs_counter_for(cluster_name)
+          @mu.synchronize { @lrs_clusters.key?(cluster_name) ? @lrs_counters[cluster_name] : nil }
         end
 
         def close
-          ads_thread, lrs_thread = @mu.synchronize do
+          ads_thread, lrs_thread, status_thread = @mu.synchronize do
             return if @closed
             @closed = true
             @cv.broadcast
             @request_queue&.push(:stop)
             @lrs_request_queue&.push(:stop)
-            [@stream_thread, @lrs_thread]
+            [@stream_thread, @lrs_thread, @status_thread]
           end
+          # Wakes both the ADS/LRS streams' next write attempt (a call on a
+          # destroyed Channel raises) and the status thread's blocked
+          # #watch_connectivity_state, and drops this server's channelz
+          # entry.
+          @channel.close
           ads_thread.wakeup if ads_thread.alive?
           ads_thread.join(5)
           if lrs_thread
             lrs_thread.wakeup if lrs_thread.alive?
             lrs_thread.join(5)
           end
+          status_thread.join(5)
           nil
         end
 
@@ -178,15 +202,31 @@ module GRPC
           type == 'insecure' ? :this_channel_is_insecure : ChannelCredentials.new
         end
 
-        # ---- Subscription bookkeeping and request sending.
+        # ---- Connectivity-state watch: reports this connection's health
+        # to XdsClient so it can trigger (or revert) fallback without
+        # waiting for the next #subscribe.
 
-        def subscribe(type_url, name)
-          @mu.synchronize do
-            next if @subscribed[type_url].key?(name)
-            @subscribed[type_url][name] = true
-            send_request_locked(type_url)
+        def watch_status
+          last = @channel.connectivity_state(false)
+          until @mu.synchronize { @closed }
+            # An absolute Time, as Channel#watch_connectivity_state takes
+            # its deadline: a monotonic reading would be read as epoch
+            # seconds, already past, and this loop would spin.
+            changed = @channel.watch_connectivity_state(last, Time.now + STATUS_POLL_INTERVAL)
+            next unless changed
+            current = @channel.connectivity_state(false)
+            next if current == last
+            last = current
+            @on_status_change.call(self, current != ConnectivityStates::TRANSIENT_FAILURE)
           end
+        rescue RuntimeError
+          # #close already destroyed @channel; connectivity_state raises
+          # "closed!" for any call after that, which just means this
+          # thread's work is done.
+          nil
         end
+
+        # ---- Subscription bookkeeping and request sending.
 
         def build_request_locked(type_url, error_detail: nil)
           request = Envoy::Service::Discovery::V3::DiscoveryRequest.new(
@@ -222,49 +262,35 @@ module GRPC
           build_request_locked(type_url)
         end
 
-        # ---- Response processing: decode, ACK or NACK, follow the chain.
+        # ---- Response processing: decode, ACK or NACK, report upward.
 
         class DecodeError < StandardError; end
 
         def handle_response(response)
           type_url = response.type_url
           decoded = decode_resources(type_url, response.resources)
-          notifications = @mu.synchronize do
+          @mu.synchronize do
             @nonces[type_url] = response.nonce
-            apply_locked(type_url, decoded)
             @versions[type_url] = response.version_info
             send_request_locked(type_url)
             @cv.broadcast
-            pending_notifications_locked
           end
-          # Off @mu: a watcher (Channel#apply_resolver_push) pokes a
-          # Subchannel, and this connection's lock must never be held
-          # while that happens, mirroring the rule Channel itself follows
-          # for its own lock in #maybe_start_connect.
-          notifications.each { |block, addresses| block.call(addresses) }
+          # Off @mu: XdsClient's own lock must never be taken while this
+          # connection's lock is held, mirroring the rule Channel itself
+          # follows for its own lock in #maybe_start_connect. A response
+          # that accepted proves the connection alive even if it named no
+          # resources this authority still cares about, so #on_healthy
+          # (gRFC A71's "fall forward") runs unconditionally; #on_resource
+          # then updates whichever authorities' caches actually subscribed
+          # to what came back.
+          @on_healthy.call(self)
+          @on_resource.call(self, type_url, decoded)
         rescue DecodeError => e
           @mu.synchronize do
             @nonces[type_url] = response.nonce
             status = Google::Rpc::Status.new(code: StatusCodes::INVALID_ARGUMENT, message: e.message)
             send_request_locked(type_url, error_detail: status)
           end
-        end
-
-        # Every watched listener name whose #endpoints_for_locked answer
-        # just changed, paired with the addresses to deliver to each of
-        # its callbacks. Computed under @mu -- #endpoints_for_locked reads
-        # the tables #apply_locked just wrote -- but returned rather than
-        # invoked, so the caller can call back off this connection's lock.
-        def pending_notifications_locked
-          pairs = []
-          @watchers.each do |listener_name, callbacks|
-            next if callbacks.empty?
-            addresses = endpoints_for_locked(listener_name)
-            next if addresses.nil? || addresses == @watch_last[listener_name]
-            @watch_last[listener_name] = addresses
-            callbacks.each_value { |block| pairs << [block, addresses] }
-          end
-          pairs
         end
 
         def decode_resources(type_url, anys)
@@ -275,120 +301,6 @@ module GRPC
           end
         rescue Google::Protobuf::ParseError => e
           raise DecodeError, "malformed #{type_url} resource: #{e.message}"
-        end
-
-        # Stores the newly accepted resources and, still under @mu,
-        # subscribes to whatever the next link in the chain names.
-        def apply_locked(type_url, decoded)
-          @resources[type_url].merge!(decoded)
-          case type_url
-          when TYPE_LISTENER then decoded.each_value { |l| follow_listener_locked(l) }
-          when TYPE_ROUTE then decoded.each_key { |name| follow_route_locked(name) }
-          when TYPE_CLUSTER then decoded.each_value { |c| follow_cluster_locked(c) }
-          end
-        end
-
-        def follow_listener_locked(listener)
-          route_config_name = route_config_name_of(listener)
-          return if route_config_name.nil?
-          @listener_route_config[listener.name] = route_config_name
-          return if @subscribed[TYPE_ROUTE].key?(route_config_name)
-          @subscribed[TYPE_ROUTE][route_config_name] = true
-          send_request_locked(TYPE_ROUTE)
-        end
-
-        # A Listener's ApiListener wraps an HttpConnectionManager as an
-        # Any; this reaches into it for the RDS route_config_name, the
-        # only piece this client needs. An inline route_config (no RDS
-        # indirection) is decoded straight into @resources[TYPE_ROUTE]
-        # under its own name so the RDS-following logic below needs no
-        # special case for it.
-        def route_config_name_of(listener)
-          any = listener.api_listener&.api_listener
-          return nil if any.nil?
-          hcm = Envoy::Extensions::Filters::Network::HttpConnectionManager::V3::HttpConnectionManager.decode(any.value)
-          case hcm.route_specifier
-          when :rds then hcm.rds.route_config_name
-          when :route_config
-            @resources[TYPE_ROUTE][hcm.route_config.name] = hcm.route_config
-            hcm.route_config.name
-          end
-        rescue Google::Protobuf::ParseError
-          nil
-        end
-
-        def follow_route_locked(route_config_name)
-          route = @resources[TYPE_ROUTE][route_config_name]
-          cluster_name = cluster_name_of(route)
-          return if cluster_name.nil?
-          @route_cluster[route_config_name] = cluster_name
-          return if @subscribed[TYPE_CLUSTER].key?(cluster_name)
-          @subscribed[TYPE_CLUSTER][cluster_name] = true
-          send_request_locked(TYPE_CLUSTER)
-        end
-
-        # Picks the first route of the first plausibly-matching virtual
-        # host. Full domain and path/header matching, and weighted-cluster
-        # splits beyond "use the heaviest", are beyond what an
-        # EDS-endpoints-only client needs.
-        def cluster_name_of(route_config)
-          return nil if route_config.nil?
-          vhost = route_config.virtual_hosts.first
-          return nil if vhost.nil?
-          route = vhost.routes.find { |r| r.action == :route }
-          route.nil? ? nil : cluster_of_action(route.route)
-        end
-
-        # A route names either one cluster or a weighted set. With no
-        # weighted routing here, the heaviest is the only sensible reading
-        # of the set.
-        def cluster_of_action(action)
-          return action.cluster unless action.cluster.empty?
-          action.weighted_clusters&.clusters&.max_by(&:weight)&.name
-        end
-
-        def follow_cluster_locked(cluster)
-          eds_name = cluster.eds_cluster_config&.service_name
-          eds_name = cluster.name if eds_name.nil? || eds_name.empty?
-          @cluster_eds_name[cluster.name] = eds_name
-          note_lrs_locked(cluster)
-          return if @subscribed[TYPE_ENDPOINT].key?(eds_name)
-          @subscribed[TYPE_ENDPOINT][eds_name] = true
-          send_request_locked(TYPE_ENDPOINT)
-        end
-
-        # Walks listener -> route config -> cluster -> endpoints. nil at
-        # any link means "still waiting", not "failed" --
-        # #resolve_endpoints times that out rather than raising early,
-        # since the next response may complete the chain.
-        def endpoints_for_locked(listener_name)
-          listener = @resources[TYPE_LISTENER][listener_name]
-          return nil if listener.nil?
-          route_config_name = @listener_route_config[listener_name]
-          return nil if route_config_name.nil?
-          cluster_name = @route_cluster[route_config_name]
-          return nil if cluster_name.nil?
-          eds_name = @cluster_eds_name[cluster_name]
-          return nil if eds_name.nil?
-          cla = @resources[TYPE_ENDPOINT][eds_name]
-          return nil if cla.nil?
-          endpoints_of(cla, cluster_name)
-        end
-
-        def endpoints_of(cla, cluster_name)
-          counter = lrs_counter_for_locked(cluster_name)
-          cla.endpoints.flat_map do |locality|
-            locality.lb_endpoints
-                    .reject { |lbe| UNUSABLE_HEALTH_STATUSES.include?(lbe.health_status) }
-                    .filter_map { |lbe| target_of(lbe, counter) }
-          end
-        end
-
-        def target_of(lb_endpoint, lrs_counter)
-          socket_address = lb_endpoint.endpoint&.address&.socket_address
-          return nil if socket_address.nil?
-          Transport::Target.new(:tcp, socket_address.address, socket_address.port_value, nil, nil,
-                                lb_endpoint.load_balancing_weight&.value, nil, lrs_counter)
         end
 
         # ---- The ADS stream itself: connect, drive request/response, and
@@ -418,11 +330,11 @@ module GRPC
             @request_queue = queue
             RESOURCE_CLASSES.each_key { |type_url| send_request_locked(type_url) unless @subscribed[type_url].empty? }
           end
-          # A fresh Channel per attempt, since the reconnect backoff picks
-          # up where a dropped stream left off. Leaving it open past this
-          # attempt would leak its connection-maintenance thread on every
-          # reconnect.
-          stub = GRPC::ClientStub.new(@server_uri, @channel_creds)
+          # Rides the one persistent @channel (see #initialize) rather than
+          # opening a fresh Channel per attempt -- ClientStub#close below
+          # is then a no-op on it, and channelz keeps reporting this
+          # server's state across the reconnect.
+          stub = GRPC::ClientStub.new(@server_uri, @channel_creds, channel_override: @channel)
           begin
             requests = Enumerator.new { |y| pump_requests(queue, y) }
             marshal = ->(msg) { msg.class.encode(msg) }
@@ -466,14 +378,8 @@ module GRPC
 
         # ---- LRS: opened lazily, the first time a Cluster's lrs_server
         # names this same management server ("self"), and driven with its
-        # own reconnect loop exactly like the ADS stream above.
-
-        def note_lrs_locked(cluster)
-          return unless cluster.lrs_server&.config_source_specifier == :self
-          return if @lrs_clusters.key?(cluster.name)
-          @lrs_clusters[cluster.name] = true
-          ensure_lrs_stream_locked
-        end
+        # own reconnect loop exactly like the ADS stream above, over the
+        # same persistent @channel.
 
         def ensure_lrs_stream_locked
           return unless @lrs_thread.nil?
@@ -481,15 +387,6 @@ module GRPC
             Thread.current.name = 'xds-lrs'
             drive_lrs_stream
           end
-        end
-
-        # nil (LRS never requested by any cluster on this connection) or
-        # not yet requested for +cluster_name+ specifically: no counter,
-        # so the resolved Target carries none and Subchannel/Connection
-        # never wire up anything for it.
-        def lrs_counter_for_locked(cluster_name)
-          return nil unless @lrs_clusters.key?(cluster_name)
-          @lrs_counters[cluster_name]
         end
 
         def drive_lrs_stream
@@ -514,7 +411,7 @@ module GRPC
           require_relative '../generic/client_stub'
           queue = Queue.new
           @mu.synchronize { @lrs_request_queue = queue }
-          stub = GRPC::ClientStub.new(@server_uri, @channel_creds)
+          stub = GRPC::ClientStub.new(@server_uri, @channel_creds, channel_override: @channel)
           begin
             queue.push(Envoy::Service::LoadStats::V3::LoadStatsRequest.new(node: @node))
             requests = Enumerator.new { |y| pump_lrs_requests(queue, y) }
