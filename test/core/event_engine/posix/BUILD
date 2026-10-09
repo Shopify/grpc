@@ -575,6 +575,7 @@ grpc_cc_test(
         "//:event_engine_base_hdrs",
         "//:gpr_platform",
         "//:grpc",
+        "//src/core:ares_resolver",
         "//src/core:event_engine_tcp_socket_utils",
         "//src/core:ares_resolver",
         "//src/core:notification",
