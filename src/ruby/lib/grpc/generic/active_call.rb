@@ -289,7 +289,7 @@ module GRPC
              recv_message_batch_result.message.nil?
         return @unmarshal.call(recv_message_batch_result.message)
       end
-      GRPC.logger.debug('found nil; the final response has been sent')
+      GRPC.log_target.debug('found nil; the final response has been sent')
       nil
     end
 

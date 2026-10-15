@@ -137,8 +137,8 @@ module GRPC
         end
         batch_result
       rescue GRPC::Core::CallError => e
-        GRPC.logger.warn('bidi call: read_using_run_batch failed')
-        GRPC.logger.warn(e)
+        GRPC.log_target.warn('bidi call: read_using_run_batch failed')
+        GRPC.log_target.warn(e)
         nil
       end
     end
@@ -147,7 +147,7 @@ module GRPC
     # rubocop:disable Metrics/PerceivedComplexity
     def write_loop(requests, is_client: true, set_output_stream_done: nil)
       GRPC::Core.fork_unsafe_begin
-      GRPC.logger.debug('bidi-write-loop: starting')
+      GRPC.log_target.debug('bidi-write-loop: starting')
       count = 0
       # One hash, refilled per message. This loop is the only thread sending
       # on this call, and #run_batch does not keep what it is given.
@@ -164,8 +164,8 @@ module GRPC
         rescue GRPC::Core::CallError => e
           # This is almost definitely caused by a status arriving while still
           # writing. Don't re-throw the error
-          GRPC.logger.warn('bidi-write-loop: ended with error')
-          GRPC.logger.warn(e)
+          GRPC.log_target.warn('bidi-write-loop: ended with error')
+          GRPC.log_target.warn(e)
           break
         end
       end
@@ -175,15 +175,15 @@ module GRPC
         begin
           @call.run_batch(SEND_CLOSE_FROM_CLIENT => nil)
         rescue GRPC::Core::CallError => e
-          GRPC.logger.warn('bidi-write-loop: send close failed')
-          GRPC.logger.warn(e)
+          GRPC.log_target.warn('bidi-write-loop: send close failed')
+          GRPC.log_target.warn(e)
         end
-        GRPC.logger.debug('bidi-write-loop: done')
+        GRPC.log_target.debug('bidi-write-loop: done')
       end
-      GRPC.logger.debug('bidi-write-loop: finished')
+      GRPC.log_target.debug('bidi-write-loop: finished')
     rescue StandardError => e
-      GRPC.logger.warn('bidi-write-loop: failed')
-      GRPC.logger.warn(e)
+      GRPC.log_target.warn('bidi-write-loop: failed')
+      GRPC.log_target.warn(e)
       if is_client
         @call.cancel_with_status(GRPC::Core::StatusCodes::UNKNOWN,
                                  "GRPC bidi call error: #{e.inspect}")
@@ -201,7 +201,7 @@ module GRPC
       return enum_for(:read_loop,
                       set_input_stream_done,
                       is_client: is_client) unless block_given?
-      GRPC.logger.debug('bidi-read-loop: starting')
+      GRPC.log_target.debug('bidi-read-loop: starting')
       begin
         count = 0
         # queue the initial read before beginning the loop
@@ -222,7 +222,7 @@ module GRPC
               batch_result.check_status
             end
 
-            GRPC.logger.debug('bidi-read-loop: done reading!')
+            GRPC.log_target.debug('bidi-read-loop: done reading!')
             break
           end
 
@@ -230,13 +230,13 @@ module GRPC
           yield res
         end
       rescue StandardError => e
-        GRPC.logger.warn('bidi: read-loop failed')
-        GRPC.logger.warn(e)
+        GRPC.log_target.warn('bidi: read-loop failed')
+        GRPC.log_target.warn(e)
         raise e
       ensure
         set_input_stream_done.call
       end
-      GRPC.logger.debug('bidi-read-loop: finished')
+      GRPC.log_target.debug('bidi-read-loop: finished')
       # Make sure that the write loop is done before finishing the call.
       # Note that blocking is ok at this point because we've already received
       # a status

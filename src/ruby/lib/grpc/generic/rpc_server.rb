@@ -59,10 +59,10 @@ module GRPC
       return if blk.nil?
       @stop_mutex.synchronize do
         if @stopped
-          GRPC.logger.warn('did not schedule job, already stopped')
+          GRPC.log_target.warn('did not schedule job, already stopped')
           return
         end
-        GRPC.logger.info('schedule another job')
+        GRPC.log_target.info('schedule another job')
         fail 'No worker threads available' if @ready_workers.empty?
         worker_queue = @ready_workers.pop
 
@@ -91,7 +91,7 @@ module GRPC
 
     # Stops the jobs in the pool
     def stop
-      GRPC.logger.info('stopping, will wait for all the workers to exit')
+      GRPC.log_target.info('stopping, will wait for all the workers to exit')
       @stop_mutex.synchronize do  # wait @keep_alive seconds for workers to stop
         @stopped = true
         loop do
@@ -102,7 +102,7 @@ module GRPC
         @stop_cond.wait(@stop_mutex, @keep_alive) if @workers.size > 0
       end
       forcibly_stop_workers
-      GRPC.logger.info('stopped, all workers are shutdown')
+      GRPC.log_target.info('stopped, all workers are shutdown')
     end
 
     protected
@@ -116,8 +116,8 @@ module GRPC
         begin
           t.exit
         rescue StandardError => e
-          GRPC.logger.warn('error while terminating a worker')
-          GRPC.logger.warn(e)
+          GRPC.log_target.warn('error while terminating a worker')
+          GRPC.log_target.warn(e)
         end
       end
     end
@@ -137,8 +137,8 @@ module GRPC
           blk, args = worker_queue.pop
           blk.call(*args)
         rescue StandardError, GRPC::Core::CallError => e
-          GRPC.logger.warn('Error in worker thread')
-          GRPC.logger.warn(e)
+          GRPC.log_target.warn('Error in worker thread')
+          GRPC.log_target.warn(e)
         end
         # there shouldn't be any work given to this thread while its busy
         fail('received a task while busy') unless worker_queue.empty?
@@ -417,7 +417,7 @@ module GRPC
     # Sends RESOURCE_EXHAUSTED if there are too many unprocessed jobs
     def available?(an_rpc)
       return an_rpc if @pool.ready_for_work?
-      GRPC.logger.warn('no free worker threads currently')
+      GRPC.log_target.warn('no free worker threads currently')
       noop = proc { |x| x }
 
       # Create a new active call that knows that metadata hasn't been

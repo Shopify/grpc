@@ -76,7 +76,7 @@ module GRPC
           nil
         end
       end
-      NULL_ADDRESS_WATCH = NullWatch.new
+      NULL_ADDRESS_WATCH = NullWatch.new.freeze
 
       module_function
 
@@ -206,6 +206,11 @@ module GRPC
       # falls back to a plain A/AAAA lookup exactly as gRPC's DNS resolver
       # does.
       def srv_addresses(target)
+        # Resolv keeps class variables, which only the main Ractor may use;
+        # elsewhere, resolve the plain A/AAAA records the way a host with no
+        # SRV record would.
+        return [] unless Ractor.current == Ractor.main
+
         records = Resolv::DNS.open do |dns|
           dns.getresources("_grpc_config._tcp.#{target.host}", Resolv::DNS::Resource::IN::SRV)
         end
@@ -221,6 +226,10 @@ module GRPC
       # config, if any, through the xDS control plane instead.
       def service_config_json(target)
         return nil unless target.scheme == :tcp
+        # Resolv keeps class variables, which only the main Ractor may use;
+        # elsewhere, behave as for a host that publishes no grpc_config TXT
+        # record, so the channel uses the caller's service config.
+        return nil unless Ractor.current == Ractor.main
         records = Resolv::DNS.open { |dns| dns.getresources(target.host, Resolv::DNS::Resource::IN::TXT) }
         match = records.map(&:data).find { |text| text.start_with?('grpc_config=') }
         match&.delete_prefix('grpc_config=')

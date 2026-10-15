@@ -315,7 +315,7 @@ module GRPC
               run_stream_once
               @backoff.reset
             rescue StandardError => e
-              GRPC.logger.debug("xDS ADS stream to #{@server_uri} failed: #{e.class}: #{e.message}")
+              GRPC.log_target.debug("xDS ADS stream to #{@server_uri} failed: #{e.class}: #{e.message}")
             end
             break if @mu.synchronize { @closed }
             sleep(@backoff.next_delay)
@@ -395,7 +395,7 @@ module GRPC
               run_lrs_stream_once
               @lrs_backoff.reset
             rescue StandardError => e
-              GRPC.logger.debug("xDS LRS stream to #{@server_uri} failed: #{e.class}: #{e.message}")
+              GRPC.log_target.debug("xDS LRS stream to #{@server_uri} failed: #{e.class}: #{e.message}")
             end
             break if @mu.synchronize { @closed }
             # A fresh stream restarts the handshake from scratch: the

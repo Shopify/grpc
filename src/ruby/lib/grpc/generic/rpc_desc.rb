@@ -149,7 +149,7 @@ module GRPC
       # UNIMPLEMENTED because NotImplementedError is intended for low-level
       # OS interaction (e.g. syscalls) not supported by the current OS.
       GRPC.log_warn { "failed handler: #{active_call}; sending status:UNKNOWN" }
-      GRPC.logger.warn(e)
+      GRPC.log_target.warn(e)
       send_status(active_call, UNKNOWN, "#{e.class}: #{e.message}")
     end
 
@@ -198,7 +198,7 @@ module GRPC
       active_client.send_status(code, details, code == OK, metadata: metadata)
     rescue StandardError => e
       GRPC.log_warn { "Could not send status #{code}:#{details}" }
-      GRPC.logger.warn(e)
+      GRPC.log_target.warn(e)
     end
   end
 end

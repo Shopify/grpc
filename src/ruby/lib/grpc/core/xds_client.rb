@@ -298,7 +298,7 @@ module GRPC
         if astate.nil?
           servers = authority_servers_for(authority_key)
           if servers.nil?
-            GRPC.logger.debug(
+            GRPC.log_target.debug(
               "xDS: #{name.inspect} names authority #{authority_key.inspect}, which the bootstrap " \
               'does not define; it will never resolve'
             )

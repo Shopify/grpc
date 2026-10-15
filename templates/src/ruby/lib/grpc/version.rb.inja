@@ -14,5 +14,5 @@
 
 # GRPC contains the General RPC module.
 module GRPC
-  VERSION = '{{settings.ruby_version.ruby_version}}'
+  VERSION = '{{settings.ruby_version.ruby_version}}'.freeze
 end

@@ -15,16 +15,21 @@
 # GRPC contains the General RPC module.
 module GRPC
   def self.logger=(logger_obj)
-    # Need a free variable here to keep value of logger_obj for logger closure
     @logger = logger_obj
+    # Only the main Ractor may read a module ivar holding an unshareable
+    # object, such as a ::Logger. Other Ractors fall back to the no-op
+    # logger rather than fail on every log call.
+    @logger_shareable = Ractor.shareable?(logger_obj)
+    extend(ConfiguredLogger)
+  end
 
-    extend(
-      Module.new do
-        def logger
-          @logger
-        end
-      end
-    )
+  # Installed by GRPC.logger=.
+  module ConfiguredLogger
+    def logger
+      return @logger if @logger_shareable || Ractor.current == Ractor.main
+
+      DefaultLogger::LOGGER
+    end
   end
 
   # DefaultLogger is a module included in GRPC if no other logging is set up for
@@ -49,7 +54,7 @@ module GRPC
       end
     end
 
-    LOGGER = NoopLogger.new
+    LOGGER = NoopLogger.new.freeze
   end
 
   # Internal logging helpers.
@@ -63,8 +68,19 @@ module GRPC
   # accepts any object a user supplies, and plenty of them define debug(msg)
   # with a required argument; calling such a logger with a block and no
   # argument raises ArgumentError.
+  # The logger these helpers write to. Only the main Ractor can read an
+  # arbitrary GRPC.logger, which may be a ::Logger or one a logging framework
+  # injects; another Ractor uses it only when GRPC.logger= saw a shareable
+  # object, and otherwise logs nothing.
+  def self.log_target
+    return logger if Ractor.current == Ractor.main
+    return logger if @logger_shareable
+
+    DefaultLogger::LOGGER
+  end
+
   def self.log_debug
-    log = logger
+    log = log_target
     return nil if log.is_a?(DefaultLogger::NoopLogger)
     return nil if log.respond_to?(:debug?) && !log.debug?
     log.debug(yield)
@@ -72,7 +88,7 @@ module GRPC
   end
 
   def self.log_info
-    log = logger
+    log = log_target
     return nil if log.is_a?(DefaultLogger::NoopLogger)
     return nil if log.respond_to?(:info?) && !log.info?
     log.info(yield)
@@ -80,7 +96,7 @@ module GRPC
   end
 
   def self.log_warn
-    log = logger
+    log = log_target
     return nil if log.is_a?(DefaultLogger::NoopLogger)
     return nil if log.respond_to?(:warn?) && !log.warn?
     log.warn(yield)

@@ -30,39 +30,48 @@ module GRPC
     # reachable) and holds the channel only in the WeakMap's value slot,
     # which the runtime drops once nothing else references it.
     module Channelz
-      MUTEX = Mutex.new
-      # channel_id (Integer) => Channel, weakly. A WeakMap key stays alive
-      # only as long as something else references it; the Integer keys
-      # here always do (Ruby Integers aren't garbage collected), so the
-      # weakness that matters is entirely on the value side.
+      # The registry lives in Ractor-local storage: a non-main Ractor may not
+      # touch a Mutex or WeakMap held in a constant, nor set a module ivar.
+      # Each Ractor therefore numbers and lists its own channels.
+      #
+      # channels: channel_id (Integer) => Channel, weakly. A WeakMap key
+      # stays alive only as long as something else references it; the
+      # Integer keys here always do (Ruby Integers aren't garbage collected),
+      # so the weakness that matters is entirely on the value side.
       #
       # Unregistering removes the key where ObjectSpace::WeakMap#delete
       # exists (Ruby 3.3+). On 3.2 it assigns nil: the id reads back as
       # gone at once, but an Integer => nil entry holds only immediates,
       # which GC never collects, so each closed channel leaves one small
       # entry behind there.
-      CHANNELS = ObjectSpace::WeakMap.new
-      DELETABLE = CHANNELS.respond_to?(:delete)
-      private_constant :MUTEX, :CHANNELS, :DELETABLE
-      @next_id = 1
+      Registry = Struct.new(:mutex, :channels, :next_id)
+      DELETABLE = ObjectSpace::WeakMap.new.respond_to?(:delete)
+      private_constant :Registry, :DELETABLE
+
+      def self.registry
+        Ractor.current[:grpc_core_channelz] ||= Registry.new(Mutex.new, ObjectSpace::WeakMap.new, 1)
+      end
+      private_class_method :registry
 
       # Registers +channel+ and returns its new, unique, positive id.
       def self.register_channel(channel)
-        MUTEX.synchronize do
-          id = @next_id
-          @next_id += 1
-          CHANNELS[id] = channel
+        reg = registry
+        reg.mutex.synchronize do
+          id = reg.next_id
+          reg.next_id += 1
+          reg.channels[id] = channel
           id
         end
       end
 
       # Drops +channel_id+ from the registry. Safe to call more than once.
       def self.unregister_channel(channel_id)
-        MUTEX.synchronize do
+        reg = registry
+        reg.mutex.synchronize do
           if DELETABLE
-            CHANNELS.delete(channel_id)
+            reg.channels.delete(channel_id)
           else
-            CHANNELS[channel_id] = nil
+            reg.channels[channel_id] = nil
           end
         end
         nil
@@ -72,15 +81,18 @@ module GRPC
       # [id, channel] pairs. A channel garbage collected without #close,
       # or already unregistered, has a nil value and is excluded.
       def self.channels_from(start_id)
-        MUTEX.synchronize do
-          CHANNELS.keys.select { |id| id >= start_id && !CHANNELS[id].nil? }
-                       .sort.map { |id| [id, CHANNELS[id]] }
+        reg = registry
+        reg.mutex.synchronize do
+          channels = reg.channels
+          channels.keys.select { |id| id >= start_id && !channels[id].nil? }
+                       .sort.map { |id| [id, channels[id]] }
         end
       end
 
       # The live channel registered under +channel_id+, or nil.
       def self.channel(channel_id)
-        MUTEX.synchronize { CHANNELS[channel_id] }
+        reg = registry
+        reg.mutex.synchronize { reg.channels[channel_id] }
       end
     end
   end

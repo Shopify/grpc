@@ -48,14 +48,18 @@ module GRPC
       AWAIT_POLL_INTERVAL = 0.02
 
       # Every live channel, weakly held, so that GRPC.postfork_child can drop
-      # the transports a child process inherited but cannot drive.
-      LIVE = ObjectSpace::WeakMap.new
+      # the transports a child process inherited but cannot drive. Kept per
+      # Ractor: a non-main Ractor can neither read a WeakMap held in a
+      # constant nor write to one, and a fork keeps only the forking Ractor.
+      def self.live_channels
+        Ractor.current[:grpc_core_live_channels] ||= ObjectSpace::WeakMap.new
+      end
 
       # Discards the inherited transport of every channel in this process.
       # Only safe to call in a freshly forked child, where a single thread
       # runs and the inherited mutexes may be held by threads that are gone.
       def self.reset_all_after_fork!
-        LIVE.each_key(&:reset_after_fork!)
+        live_channels.each_key(&:reset_after_fork!)
         nil
       end
 
@@ -100,7 +104,7 @@ module GRPC
         @outlier_detection_timer = nil
         @last_error = nil
         @destroyed = false
-        LIVE[self] = true
+        Channel.live_channels[self] = true
         @channelz_id = Channelz.register_channel(self)
       end
 

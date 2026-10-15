@@ -21,6 +21,49 @@ module GRPC
   #
   # Is intended to be used to support both client and server
   # IDL-schema-derived servers.
+  # Bodies for the methods GenericService defines. A method defined from a
+  # block can only be called in the Ractor that defined it unless the block
+  # is shareable, and a block is shareable only when its self and everything
+  # it captures are: hence procs built here, in a module, from frozen values.
+  module StubMethods
+    UNIMPLEMENTED = Ractor.make_shareable(proc do |*|
+      fail GRPC::BadStatus.new_status_exception(
+        GRPC::Core::StatusCodes::UNIMPLEMENTED)
+    end)
+
+    def self.for(desc, route_name)
+      route = route_name.dup.freeze
+      marshal_method = desc.marshal_method
+      marshal = Ractor.make_shareable(proc { |o| o.class.send(marshal_method, o).to_s })
+      output = desc.output
+      unmarshal_class = output.is_a?(RpcDesc::Stream) ? output.type : output
+      unmarshal_method = desc.unmarshal_method
+      unmarshal = Ractor.make_shareable(proc { |o| unmarshal_class.send(unmarshal_method, o) })
+      body = if desc.request_response?
+               proc do |req, metadata = {}|
+                 GRPC.log_debug { "calling #{@host}:#{route}" }
+                 request_response(route, req, marshal, unmarshal, **metadata)
+               end
+             elsif desc.client_streamer?
+               proc do |reqs, metadata = {}|
+                 GRPC.log_debug { "calling #{@host}:#{route}" }
+                 client_streamer(route, reqs, marshal, unmarshal, **metadata)
+               end
+             elsif desc.server_streamer?
+               proc do |req, metadata = {}, &blk|
+                 GRPC.log_debug { "calling #{@host}:#{route}" }
+                 server_streamer(route, req, marshal, unmarshal, **metadata, &blk)
+               end
+             else # is a bidi_stream
+               proc do |reqs, metadata = {}, &blk|
+                 GRPC.log_debug { "calling #{@host}:#{route}" }
+                 bidi_streamer(route, reqs, marshal, unmarshal, **metadata, &blk)
+               end
+             end
+      Ractor.make_shareable(body)
+    end
+  end
+
   module GenericService
     # creates a new string that is the underscore separate version of s.
     #
@@ -96,10 +139,7 @@ module GRPC
         rpc_descs[name] = RpcDesc.new(name, input, output,
                                       marshal_class_method,
                                       unmarshal_class_method)
-        define_method(GenericService.underscore(name.to_s).to_sym) do |*|
-          fail GRPC::BadStatus.new_status_exception(
-            GRPC::Core::StatusCodes::UNIMPLEMENTED)
-        end
+        define_method(GenericService.underscore(name.to_s).to_sym, &StubMethods::UNIMPLEMENTED)
       end
 
       def inherited(subclass)
@@ -159,33 +199,13 @@ module GRPC
           end
 
           # Used define_method to add a method for each rpc_desc.  Each method
-          # calls the base class method for the given descriptor.
+          # calls the base class method for the given descriptor. The method
+          # bodies are shareable procs (see StubMethods), so a stub works in
+          # any Ractor, not only the one that loaded the service.
           descs.each_pair do |name, desc|
             mth_name = GenericService.underscore(name.to_s).to_sym
-            marshal = desc.marshal_proc
-            unmarshal = desc.unmarshal_proc(:output)
             route = "/#{route_prefix}/#{name}"
-            if desc.request_response?
-              define_method(mth_name) do |req, metadata = {}|
-                GRPC.log_debug { "calling #{@host}:#{route}" }
-                request_response(route, req, marshal, unmarshal, **metadata)
-              end
-            elsif desc.client_streamer?
-              define_method(mth_name) do |reqs, metadata = {}|
-                GRPC.log_debug { "calling #{@host}:#{route}" }
-                client_streamer(route, reqs, marshal, unmarshal, **metadata)
-              end
-            elsif desc.server_streamer?
-              define_method(mth_name) do |req, metadata = {}, &blk|
-                GRPC.log_debug { "calling #{@host}:#{route}" }
-                server_streamer(route, req, marshal, unmarshal, **metadata, &blk)
-              end
-            else  # is a bidi_stream
-              define_method(mth_name) do |reqs, metadata = {}, &blk|
-                GRPC.log_debug { "calling #{@host}:#{route}" }
-                bidi_streamer(route, reqs, marshal, unmarshal, **metadata, &blk)
-              end
-            end
+            define_method(mth_name, &StubMethods.for(desc, route))
           end
         end
       end

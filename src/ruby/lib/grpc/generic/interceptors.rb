@@ -42,7 +42,7 @@ module GRPC
     # @param [Hash] metadata
     #
     def request_response(request: nil, call: nil, method: nil, metadata: nil)
-      GRPC.logger.debug "Intercepting request response method #{method}" \
+      GRPC.log_target.debug "Intercepting request response method #{method}" \
         " for request #{request} with call #{call} and metadata: #{metadata}"
       yield
     end
@@ -56,7 +56,7 @@ module GRPC
     # @param [Hash] metadata
     #
     def client_streamer(requests: nil, call: nil, method: nil, metadata: nil)
-      GRPC.logger.debug "Intercepting client streamer method #{method}" \
+      GRPC.log_target.debug "Intercepting client streamer method #{method}" \
        " for requests #{requests} with call #{call} and metadata: #{metadata}"
       yield
     end
@@ -70,7 +70,7 @@ module GRPC
     # @param [Hash] metadata
     #
     def server_streamer(request: nil, call: nil, method: nil, metadata: nil)
-      GRPC.logger.debug "Intercepting server streamer method #{method}" \
+      GRPC.log_target.debug "Intercepting server streamer method #{method}" \
         " for request #{request} with call #{call} and metadata: #{metadata}"
       yield
     end
@@ -84,7 +84,7 @@ module GRPC
     # @param [Hash] metadata
     #
     def bidi_streamer(requests: nil, call: nil, method: nil, metadata: nil)
-      GRPC.logger.debug "Intercepting bidi streamer method #{method}" \
+      GRPC.log_target.debug "Intercepting bidi streamer method #{method}" \
         " for requests #{requests} with call #{call} and metadata: #{metadata}"
       yield
     end
@@ -103,7 +103,7 @@ module GRPC
     # @param [Method] method
     #
     def request_response(request: nil, call: nil, method: nil)
-      GRPC.logger.debug "Intercepting request response method #{method}" \
+      GRPC.log_target.debug "Intercepting request response method #{method}" \
         " for request #{request} with call #{call}"
       yield
     end
@@ -115,7 +115,7 @@ module GRPC
     # @param [Method] method
     #
     def client_streamer(call: nil, method: nil)
-      GRPC.logger.debug "Intercepting client streamer method #{method}" \
+      GRPC.log_target.debug "Intercepting client streamer method #{method}" \
         " with call #{call}"
       yield
     end
@@ -128,7 +128,7 @@ module GRPC
     # @param [Method] method
     #
     def server_streamer(request: nil, call: nil, method: nil)
-      GRPC.logger.debug "Intercepting server streamer method #{method}" \
+      GRPC.log_target.debug "Intercepting server streamer method #{method}" \
         " for request #{request} with call #{call}"
       yield
     end
@@ -141,7 +141,7 @@ module GRPC
     # @param [Method] method
     #
     def bidi_streamer(requests: nil, call: nil, method: nil)
-      GRPC.logger.debug "Intercepting bidi streamer method #{method}" \
+      GRPC.log_target.debug "Intercepting bidi streamer method #{method}" \
         " for requests #{requests} with call #{call}"
       yield
     end

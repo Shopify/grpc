@@ -461,7 +461,7 @@ module GRPC
           break if check_max_age(now)
         end
       rescue StandardError => e
-        GRPC.logger.debug("connection maintenance stopped: #{e.class}: #{e.message}")
+        GRPC.log_target.debug("connection maintenance stopped: #{e.class}: #{e.message}")
       end
 
       # Sends a PING and expects it acknowledged within +keepalive_timeout+.
