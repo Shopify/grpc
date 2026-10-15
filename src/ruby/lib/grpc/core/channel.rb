@@ -775,6 +775,9 @@ module GRPC
       def transition_locked(state)
         return if @state == state
         @backoff.reset if state == ConnectivityStates::READY
+        # The failure belongs to the TRANSIENT_FAILURE episode it caused;
+        # once the channel is dialing again or usable, it no longer applies.
+        @last_error = nil unless state == ConnectivityStates::TRANSIENT_FAILURE
         @state = state
         @cv.broadcast
       end
@@ -801,9 +804,12 @@ module GRPC
         subchannel = @lb_policy&.pick(hash_key)
         return [:ready, subchannel] if subchannel
         return nil unless @state == ConnectivityStates::TRANSIENT_FAILURE && @last_error
-        error = @last_error
-        @last_error = nil
-        [:error, error]
+        # Fail fast, as C-core does for an RPC without wait_for_ready: every
+        # pick made while the channel is in TRANSIENT_FAILURE fails with the
+        # error that put it there, not only the first. Consuming the error
+        # made the next pick -- a retry, or the next RPC on the channel --
+        # wait out the reconnect backoff and its own deadline instead.
+        [:error, @last_error]
       end
     end
   end

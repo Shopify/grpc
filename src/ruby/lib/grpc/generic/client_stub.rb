@@ -541,12 +541,17 @@ module GRPC
                         deadline: nil,
                         parent: nil,
                         credentials: nil)
+      config_timeout = @ch.method_config(method)&.timeout
       if deadline.nil?
         # The service config's timeout is the deadline the caller gets when
         # it named none; @timeout (the stub-wide default) only applies when
         # the service config says nothing about this method either.
-        default_timeout = @ch.method_config(method)&.timeout || @timeout
-        deadline = from_relative_time(default_timeout)
+        deadline = from_relative_time(config_timeout || @timeout)
+      elsif config_timeout
+        # A caller's deadline does not lift the service config's timeout:
+        # gRPC uses whichever of the two is sooner (gRFC A6, C-core).
+        remaining = Core::TimeSpec.from(deadline).to_relative_seconds
+        deadline = from_relative_time(config_timeout) if remaining.nil? || config_timeout < remaining
       end
       # Provide each new client call with its own completion queue
       call = @ch.create_call(parent, # parent call

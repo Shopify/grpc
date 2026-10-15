@@ -305,6 +305,7 @@ module GRPC
         started = @mu.synchronize do
           return if @closed
           @closed = true
+          @handshake_cv.broadcast
           @started
         end
         if started && @session.running?
@@ -413,7 +414,14 @@ module GRPC
       end
 
       def on_close
-        @mu.synchronize { @closed = true }
+        # #await_handshake sleeps on @handshake_cv until SETTINGS arrive or
+        # the connection closes; without the broadcast a peer that hangs up
+        # before its SETTINGS kept the dialer waiting out the full connect
+        # timeout instead of failing at once.
+        @mu.synchronize do
+          @closed = true
+          @handshake_cv.broadcast
+        end
         fail_all(StatusCodes::UNAVAILABLE, 'Transport closed')
         # The owner's callback is idempotent, so it is safe to run even when
         # close() already marked this connection dead.

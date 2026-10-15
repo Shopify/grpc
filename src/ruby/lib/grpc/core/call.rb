@@ -652,6 +652,10 @@ module GRPC
       end
 
       def classify(error)
+        # Running out of time while still connecting is the deadline's
+        # doing, not the transport's: C-core reports DEADLINE_EXCEEDED there.
+        return [StatusCodes::DEADLINE_EXCEEDED, 'Deadline Exceeded'] if deadline_passed?
+
         case error
         when RpcStream::ResourceExhausted
           [StatusCodes::RESOURCE_EXHAUSTED, error.message]
