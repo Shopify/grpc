@@ -119,12 +119,19 @@ place of about 6800 lines of C.
   passing `RpcStream.now + n` as a deadline names a moment decades ago:
   the call returns at once, and a loop around it spins and starves every
   other thread. Pass `Time.now + n`.
+- **An RPC fails fast unless its method config sets `waitForReady`.**
+  While the channel is in TRANSIENT_FAILURE, every pick fails at once with
+  the connect error, as in C-core. An RPC whose method config has
+  `waitForReady: true` waits until the channel connects or its deadline
+  passes, and then gets DEADLINE_EXCEEDED; without a deadline it waits
+  without limit. The service config is the only source of the setting:
+  the Ruby API has no per-call `wait_for_ready` option.
 
 ## Verification
 
 | Suite | How to run | State |
 | --- | --- | --- |
-| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 863 examples, 6 failures |
+| RSpec | `rspec -I src/ruby/lib -I src/ruby/spec -I src/ruby/pb src/ruby/spec` | 870 examples, 6 failures |
 | End to end | run each `src/ruby/end2end/*_test.rb` | 23 of 24 |
 | gRPC interop | `src/ruby/pb/test/{server,client}.rb` | 16 of 16, insecure and TLS |
 | xDS conformance | `ruby src/ruby/pb/test/xds_conformance/run.rb` | 5 of 5 |

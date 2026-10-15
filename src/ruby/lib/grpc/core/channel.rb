@@ -302,10 +302,11 @@ module GRPC
       end
 
       # Opens a stream for a new RPC, connecting first if necessary.
+      # +method+ selects the method config whose waitForReady applies.
       #
       # @api private
-      def open_stream(deadline: nil, hash_key: nil)
-        connection = await_connection(deadline, hash_key)
+      def open_stream(deadline: nil, hash_key: nil, method: nil)
+        connection = await_connection(deadline, hash_key, method)
         connection.open_rpc
       end
 
@@ -786,19 +787,46 @@ module GRPC
         @cv.broadcast
       end
 
-      # Blocks until a live connection exists, raising the connect error when
-      # the attempt fails so that Call can turn it into an UNAVAILABLE status.
-      def await_connection(deadline, hash_key = nil)
+      # Blocks until a live connection exists. While the channel is in
+      # TRANSIENT_FAILURE, an RPC fails at once with the connect error, which
+      # Call turns into UNAVAILABLE, unless the method config sets
+      # waitForReady. That RPC waits until the channel connects or its
+      # deadline passes. An RPC with no deadline normally fails when the
+      # connect cap runs out, in whatever state the channel is then; with
+      # waitForReady it waits without limit, as in C-core. A failed
+      # subchannel is dialed again only when the channel backoff makes it
+      # IDLE, so the wait does not bypass the backoff.
+      def await_connection(deadline, hash_key = nil, method = nil)
         limit = deadline || (RpcStream.now + Transport::DEFAULT_CONNECT_TIMEOUT)
+        wait_for_ready = nil
         loop do
           kind, value = @mu.synchronize { pick_or_error_locked(hash_key) }
           return value.connection if kind == :ready
-          raise value if kind == :error
-          maybe_start_connect
           remaining = limit - RpcStream.now
-          fail Connection::Closed, "connect timed out to #{@target}" if remaining <= 0
+          if kind == :error || remaining <= 0
+            # Looked up only when the RPC would otherwise fail here, and off
+            # @mu: the lookup allocates, and its first use may wait on the
+            # service config's DNS TXT lookup.
+            wait_for_ready = wait_for_ready?(method) if wait_for_ready.nil?
+            raise value if kind == :error && !wait_for_ready
+            remaining = limit = past_connect_cap(deadline, wait_for_ready) if remaining <= 0
+          end
+          maybe_start_connect
           @mu.synchronize { @cv.wait(@mu, [remaining, AWAIT_POLL_INTERVAL].min) }
         end
+      end
+
+      # The connect cap stands in for a deadline the caller did not give.
+      # Past it an RPC fails, unless it has waitForReady and no deadline of
+      # its own; then it waits without limit. Past a real deadline it always
+      # fails, and Call reports DEADLINE_EXCEEDED.
+      def past_connect_cap(deadline, wait_for_ready)
+        fail Connection::Closed, "connect timed out to #{@target}" unless wait_for_ready && deadline.nil?
+        Float::INFINITY
+      end
+
+      def wait_for_ready?(method)
+        !method.nil? && method_config(method)&.wait_for_ready == true
       end
 
       # Must be called with @mu held. Returns the subchannel to use, the error
@@ -813,6 +841,7 @@ module GRPC
         # error that put it there, not only the first. Consuming the error
         # made the next pick -- a retry, or the next RPC on the channel --
         # wait out the reconnect backoff and its own deadline instead.
+        # #await_connection decides whether an RPC with waitForReady waits.
         [:error, @last_error]
       end
     end

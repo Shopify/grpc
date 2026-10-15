@@ -456,7 +456,7 @@ module GRPC
         # they are raised before anything touching the transport.
         headers = build_request_headers(md, requested).concat(credential_headers)
         begin
-          @stream = @channel.open_stream(deadline: @monotonic_deadline, hash_key: hash_key)
+          @stream = @channel.open_stream(deadline: @monotonic_deadline, hash_key: hash_key, method: @method)
           @connection = @stream.connection
           @connection.lrs_counter&.record_issued
           @peer = @stream.peer

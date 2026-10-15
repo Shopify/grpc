@@ -28,10 +28,9 @@ module GRPC
     #
     # @api private
     class ServiceConfig
-      # The settings that apply to one RPC. +wait_for_ready+ is parsed but
-      # never consulted: this core has no notion of a subchannel being
-      # transiently unready to wait on (create_call either has a transport
-      # or it doesn't), so there is nothing for it to change.
+      # The settings that apply to one RPC. +wait_for_ready+ is the raw
+      # waitForReady value; only +true+ makes an RPC wait while the channel
+      # is in TRANSIENT_FAILURE (see Channel#await_connection).
       MethodConfig = Struct.new(:timeout, :retry_policy, :hedging_policy, :wait_for_ready)
 
       RetryPolicy = Struct.new(:max_attempts, :initial_backoff, :max_backoff,

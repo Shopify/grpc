@@ -18,8 +18,12 @@ require 'socket'
 
 # C-core semantics for an RPC without wait_for_ready: while the channel is in
 # TRANSIENT_FAILURE every pick fails at once, and a service config timeout
-# caps the caller's own deadline rather than giving way to it.
+# caps the caller's own deadline rather than giving way to it. An RPC whose
+# method config sets waitForReady waits instead, until it connects or its
+# deadline passes.
 describe 'fail-fast picks and service config timeouts' do
+  include GRPC::Spec::Helpers
+
   noop = proc { |x| x }
 
   def elapsed
@@ -38,6 +42,21 @@ describe 'fail-fast picks and service config timeouts' do
     args = { 'grpc.enable_retries' => 1,
              'grpc.service_config' => JSON.generate(methodConfig: [method_config]) }
     GRPC::ClientStub.new(target, :this_channel_is_insecure, channel_args: args)
+  end
+
+  def wait_for_ready_stub(target)
+    args = { 'grpc.service_config' => JSON.generate(methodConfig: [{ name: [{}], waitForReady: true }]),
+             'grpc.initial_reconnect_backoff_ms' => 100,
+             'grpc.min_reconnect_backoff_ms' => 100,
+             'grpc.max_reconnect_backoff_ms' => 200 }
+    EchoStub.new(target, :this_channel_is_insecure, channel_args: args)
+  end
+
+  def unused_port
+    reserved = TCPServer.new('127.0.0.1', 0)
+    reserved.addr[1]
+  ensure
+    reserved&.close
   end
 
   it 'fails every RPC and retry fast while the channel cannot connect' do
@@ -95,5 +114,49 @@ describe 'fail-fast picks and service config timeouts' do
     acceptor&.kill
     held&.each(&:close)
     silent&.close
+  end
+
+  it 'lets an RPC with waitForReady wait until the channel connects' do
+    port = unused_port
+    stub = wait_for_ready_stub("127.0.0.1:#{port}")
+    rpc = Thread.new { stub.an_rpc(EchoMsg.new(msg: 'waited'), deadline: Time.now + 15) }
+    # Let the first connect fail, so that the channel is in TRANSIENT_FAILURE.
+    sleep 0.5
+    server = new_rpc_server_for_testing(poll_period: 1)
+    server.add_http2_port("127.0.0.1:#{port}", :this_port_is_insecure)
+    server.handle(EchoService)
+    server_thread = Thread.new { server.run }
+    expect(rpc.value.msg).to eq('waited')
+  ensure
+    server&.stop
+    server_thread&.join
+  end
+
+  it 'gives an RPC with waitForReady DEADLINE_EXCEEDED when the channel never connects' do
+    stub = wait_for_ready_stub("127.0.0.1:#{unused_port}")
+    took = elapsed do
+      expect { stub.an_rpc(EchoMsg.new, deadline: Time.now + 1) }.to raise_error(GRPC::DeadlineExceeded)
+    end
+    expect(took).to be >= 0.9
+  end
+
+  it 'lets an RPC with waitForReady and no deadline outlive the connect cap' do
+    # Resolution takes longer than the cap, so the channel is still
+    # CONNECTING, with no connect error, when the cap runs out.
+    stub_const('GRPC::Core::Transport::DEFAULT_CONNECT_TIMEOUT', 0.3)
+    server = new_rpc_server_for_testing(poll_period: 1)
+    port = server.add_http2_port('127.0.0.1:0', :this_port_is_insecure)
+    server.handle(EchoService)
+    server_thread = Thread.new { server.run }
+    server.wait_till_running
+    allow(GRPC::Core::Transport).to receive(:resolve_addresses) do |target|
+      sleep 1
+      target.addresses = [GRPC::Core::Transport::Target.new(:tcp, '127.0.0.1', port, nil)]
+    end
+    stub = wait_for_ready_stub('slow-dns.example:443')
+    expect(stub.an_rpc(EchoMsg.new(msg: 'resolved')).msg).to eq('resolved')
+  ensure
+    server&.stop
+    server_thread&.join
   end
 end
